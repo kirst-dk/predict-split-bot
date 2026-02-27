@@ -1,0 +1,12 @@
+[
+  {
+    "name": "Main",
+    "private_key": "0xYOUR_PRIVY_WALLET_PRIVATE_KEY_HERE",
+    "predict_account_address": "0xYOUR_PREDICT_ACCOUNT_ADDRESS_HERE"
+  },
+  {
+    "name": "Secondary",
+    "private_key": "0xYOUR_SECOND_WALLET_PRIVATE_KEY_HERE",
+    "predict_account_address": "0xYOUR_SECOND_PREDICT_ACCOUNT_ADDRESS_HERE"
+  }
+]

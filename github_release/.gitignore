@@ -1,0 +1,31 @@
+# ══════════════════════════════════════════════
+# 🔐 СЕКРЕТЫ — НИКОГДА НЕ ДОБАВЛЯТЬ В GIT!
+# ══════════════════════════════════════════════
+.env
+accounts.json
+bot_state.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Логи
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
