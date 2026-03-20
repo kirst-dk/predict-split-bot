@@ -10,8 +10,9 @@ import os
 import sys
 import asyncio
 import logging
+from collections import deque
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 from dataclasses import dataclass
 from dotenv import load_dotenv
 
@@ -30,18 +31,21 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes, ConversationHandler
 )
 from telegram.request import HTTPXRequest
+from telegram.helpers import escape_markdown
 
 # Локальные модули
 from config import (
     API_KEY, CHAIN_ID, ChainId,
-    SPLIT_OFFSET, CHECK_INTERVAL,
+    SPLIT_OFFSET, CHECK_INTERVAL, ASK_POSITION_OFFSET, REPOSITION_DELAY, AUTO_MARKET_EXIT_ON_FULL_FILL,
     AccountConfig, load_accounts, save_accounts, ACCOUNTS,
     USE_WEBSOCKET, WS_FALLBACK_INTERVAL, WS_MARKET_REFRESH_INTERVAL,
+    REFERRAL_LINK, DISCONNECT_MESSAGE, MAX_USER_ACCOUNTS, USERS_DIR,
 )
 from predict_api import PredictAPI, wei_to_float
 from predict_trader import PredictTrader
 from predict_ws import PredictWebSocket
 from state import get_state, PersistentState, MarketTaskState, OrderState
+from user_manager import get_user_manager, UserManager
 
 # Загружаем .env
 load_dotenv()
@@ -86,6 +90,14 @@ class BotState:
         # Персистентное состояние
         self._persistent = get_state()
         
+        # Multi-user support
+        self.account_owners: Dict[str, str] = {}  # address -> telegram_id владельца
+        self.user_persistent_states: Dict[str, PersistentState] = {}  # user_id -> PersistentState
+        
+        # Лог событий по аккаунтам (для on-demand просмотра логов рефералов)
+        self.account_event_logs: Dict[str, deque] = {}  # address -> deque of events
+        self.MAX_EVENT_LOG_SIZE = 50  # Максимум событий на аккаунт
+        
         # Восстанавливаем настройки из персистентного состояния
         self.error_notifications: bool = self._persistent.get_setting('error_notifications', True)
         self.repositioning_notifications: bool = self._persistent.get_setting('repositioning_notifications', True)
@@ -100,25 +112,79 @@ class BotState:
         self._persistent.set_setting('error_notifications', self.error_notifications)
         self._persistent.set_setting('repositioning_notifications', self.repositioning_notifications)
     
-    def mark_account_running(self, address: str, name: str, running: bool):
+    def mark_account_running(self, address: str, name: str, running: bool, owner_id: str = None):
         """Отметить аккаунт как запущенный/остановленный (с персистентностью)"""
         self.running[address] = running
-        self._persistent.set_account_running(address, name, running)
+        ps = self.get_persistent_for_user(owner_id)
+        ps.set_account_running(address, name, running)
     
     def get_accounts_to_restore(self) -> List[str]:
         """Получить список аккаунтов которые нужно восстановить"""
         return self._persistent.get_running_accounts()
+    
+    def get_persistent_for_user(self, user_id: str = None) -> PersistentState:
+        """Получить PersistentState для пользователя (админ — основной, остальные — per-user)"""
+        if not user_id or user_id == TELEGRAM_ADMIN_ID:
+            return self._persistent
+        if user_id not in self.user_persistent_states:
+            um = get_user_manager()
+            state_file = um.get_user_state_file(user_id)
+            state_dir = os.path.dirname(state_file)
+            os.makedirs(state_dir, exist_ok=True)
+            self.user_persistent_states[user_id] = PersistentState(state_file)
+        return self.user_persistent_states[user_id]
+    
+    def log_account_event(self, address: str, event_type: str, message: str):
+        """Записать событие в лог аккаунта (для просмотра логов рефералов)"""
+        if address not in self.account_event_logs:
+            self.account_event_logs[address] = deque(maxlen=self.MAX_EVENT_LOG_SIZE)
+        self.account_event_logs[address].append({
+            'time': datetime.now().strftime('%H:%M:%S'),
+            'type': event_type,
+            'message': message,
+        })
+    
+    def get_account_events(self, address: str, limit: int = 20) -> list:
+        """Получить последние события аккаунта"""
+        if address not in self.account_event_logs:
+            return []
+        events = list(self.account_event_logs[address])
+        return events[-limit:]
+    
+    def get_user_events(self, user_id: str, limit: int = 20) -> list:
+        """Получить последние события всех аккаунтов пользователя"""
+        events = []
+        for addr, owner in self.account_owners.items():
+            if owner == user_id and addr in self.account_event_logs:
+                for event in self.account_event_logs[addr]:
+                    events.append(event)
+        # Сортируем по времени и берём последние
+        events.sort(key=lambda e: e['time'])
+        return events[-limit:]
+    
+    def clear_event_logs(self):
+        """Очистить все логи событий (вызывается каждые 24 часа)"""
+        count = sum(len(q) for q in self.account_event_logs.values())
+        self.account_event_logs.clear()
+        logger.info(f"🗑 Очищено {count} событий из логов аккаунтов")
         
 bot_state = BotState()
 
+SETTINGS_ASK_POSITION_MIN = 1
+SETTINGS_ASK_POSITION_MAX = 10
+SETTINGS_REPOSITION_DELAY_MIN = 0
+SETTINGS_REPOSITION_DELAY_MAX = 120
+SETTINGS_ASK_STEP = 1
+SETTINGS_DELAY_STEP = 5
 
 # =============================================================================
 # СИСТЕМА УВЕДОМЛЕНИЙ ОБ ОШИБКАХ
 # =============================================================================
 
-async def send_error_notification(error_message: str, error_type: str = "ERROR"):
-    """Отправить уведомление об ошибке администратору"""
-    if not TELEGRAM_ADMIN_ID or not bot_state.app:
+async def send_error_notification(error_message: str, error_type: str = "ERROR", chat_id: str = None):
+    """Отправить уведомление об ошибке"""
+    target_id = chat_id or TELEGRAM_ADMIN_ID
+    if not target_id or not bot_state.app:
         logger.error(f"Cannot send error notification: {error_message}")
         return
     
@@ -143,7 +209,7 @@ async def send_error_notification(error_message: str, error_type: str = "ERROR")
         )
         
         await bot_state.app.bot.send_message(
-            chat_id=int(TELEGRAM_ADMIN_ID),
+            chat_id=int(target_id),
             text=text,
             parse_mode='Markdown',
             disable_notification=True  # Тихое уведомление
@@ -152,15 +218,29 @@ async def send_error_notification(error_message: str, error_type: str = "ERROR")
         logger.error(f"Failed to send error notification: {e}")
 
 
-async def send_repositioning_notification(account_name: str, repositioned_orders: list):
+async def send_repositioning_notification(account_name: str, repositioned_orders: list,
+                                          chat_id: str = None, reposition_delay: int = None,
+                                          account_address: str = None):
     """Отправить уведомление о переставлении ордеров (тихое, не уводит бота вверх)"""
-    if not bot_state.repositioning_notifications:
-        return
-    
-    if not TELEGRAM_ADMIN_ID or not bot_state.app:
-        return
+    target_id = chat_id or TELEGRAM_ADMIN_ID
     
     if not repositioned_orders:
+        return
+    
+    # Логируем событие в буфер (всегда, независимо от флага уведомлений)
+    if account_address:
+        for order in repositioned_orders:
+            market = order.get('market_name', 'Unknown')[:25]
+            token = order.get('token', '?')
+            old_cents = order.get('old_price', 0) * 100
+            new_cents = order.get('new_price', 0) * 100
+            direction = "↑" if new_cents > old_cents else "↓"
+            bot_state.log_account_event(
+                account_address, 'reposition',
+                f"{direction} {market} {token}: {old_cents:.1f}→{new_cents:.1f}¢"
+            )
+    
+    if not bot_state.repositioning_notifications:
         return
     
     try:
@@ -187,8 +267,8 @@ async def send_repositioning_notification(account_name: str, repositioned_orders
             if quantity > 0:
                 lines.append(f"   📦 {quantity:.1f} shares (~${order_value:.2f})")
             if is_delayed:
-                from config import REPOSITION_COOLDOWN
-                lines.append(f"   ⏳ Cooldown между переставлениями: {REPOSITION_COOLDOWN} сек")
+                delay = REPOSITION_DELAY if reposition_delay is None else reposition_delay
+                lines.append(f"   ⏳ Ожидание {delay}с перед новым ордером")
         
         lines.append(f"\n🕐 {datetime.now().strftime('%H:%M:%S')}")
         
@@ -196,7 +276,7 @@ async def send_repositioning_notification(account_name: str, repositioned_orders
         
         # disable_notification=True - сообщение приходит без звука и не уводит чат вверх
         await bot_state.app.bot.send_message(
-            chat_id=int(TELEGRAM_ADMIN_ID),
+            chat_id=int(target_id),
             text=text,
             parse_mode='Markdown',
             disable_notification=True
@@ -205,9 +285,10 @@ async def send_repositioning_notification(account_name: str, repositioned_orders
         logger.error(f"Failed to send repositioning notification: {e}")
 
 
-async def send_resolved_market_notification(account_name: str, resolved_results: list):
+async def send_resolved_market_notification(account_name: str, resolved_results: list, chat_id: str = None):
     """Отправить уведомление о закрытии рынков (ГРОМКОЕ — это важное событие)"""
-    if not TELEGRAM_ADMIN_ID or not bot_state.app:
+    target_id = chat_id or TELEGRAM_ADMIN_ID
+    if not target_id or not bot_state.app:
         return
     
     if not resolved_results:
@@ -238,7 +319,7 @@ async def send_resolved_market_notification(account_name: str, resolved_results:
             )
             
             await bot_state.app.bot.send_message(
-                chat_id=int(TELEGRAM_ADMIN_ID),
+                chat_id=int(target_id),
                 text=text,
                 parse_mode='Markdown',
                 disable_notification=False,  # ГРОМКОЕ уведомление!
@@ -306,22 +387,226 @@ def admin_only_callback(func):
     return wrapper
 
 
+def authorized_user(func):
+    """Декоратор: админ или активный реферал"""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        if is_admin_user(user_id):
+            return await func(update, context)
+        um = get_user_manager()
+        if um.is_authorized(user_id):
+            um.update_last_active(user_id)
+            return await func(update, context)
+        user = um.get_user(user_id)
+        if user:
+            if user.status == 'pending':
+                await update.message.reply_text("⏳ Ваша заявка на рассмотрении. Ожидайте одобрения.")
+                return
+            if user.status == 'disabled':
+                await update.message.reply_text(f"⛔ {DISCONNECT_MESSAGE}")
+                return
+        await update.message.reply_text("⛔ Доступ запрещён. Нажмите /start для регистрации.")
+        return
+    return wrapper
+
+
+def authorized_user_callback(func):
+    """Декоратор для callback queries: админ или активный реферал"""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        if is_admin_user(user_id):
+            return await func(update, context)
+        um = get_user_manager()
+        if um.is_authorized(user_id):
+            um.update_last_active(user_id)
+            return await func(update, context)
+        await update.callback_query.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    return wrapper
+
+
+# =============================================================================
+# ХЕЛПЕРЫ МУЛЬТИ-ЮЗЕР
+# =============================================================================
+
+def is_admin_user(user_id: str) -> bool:
+    """Проверить, является ли пользователь админом"""
+    return bool(TELEGRAM_ADMIN_ID) and user_id == TELEGRAM_ADMIN_ID
+
+
+def get_accounts_for_user(user_id: str) -> List[AccountConfig]:
+    """Получить аккаунты пользователя (админ — из accounts.json, реферал — из users/<id>/accounts.json)"""
+    if is_admin_user(user_id):
+        return load_accounts()
+    um = get_user_manager()
+    return um.load_user_accounts(user_id)
+
+
+def save_accounts_for_user(user_id: str, accounts: List[AccountConfig]) -> bool:
+    """Сохранить аккаунты пользователя"""
+    if is_admin_user(user_id):
+        return save_accounts(accounts)
+    um = get_user_manager()
+    return um.save_user_accounts(user_id, accounts)
+
+
+def md(text: str) -> str:
+    """Экранировать текст для parse_mode='Markdown'."""
+    return escape_markdown(str(text), version=1)
+
+
+def get_user_trade_settings(user_id: str) -> Dict[str, Any]:
+    """Получить торговые настройки пользователя (с fallback к config.py)."""
+    ps = bot_state.get_persistent_for_user(user_id)
+
+    ask_offset = int(ps.get_setting('ask_position_offset', ASK_POSITION_OFFSET))
+    ask_offset = max(SETTINGS_ASK_POSITION_MIN, min(SETTINGS_ASK_POSITION_MAX, ask_offset))
+
+    reposition_delay = int(ps.get_setting('reposition_delay', REPOSITION_DELAY))
+    reposition_delay = max(SETTINGS_REPOSITION_DELAY_MIN, min(SETTINGS_REPOSITION_DELAY_MAX, reposition_delay))
+
+    auto_market_exit_on_full_fill = bool(
+        ps.get_setting('auto_market_exit_on_full_fill', AUTO_MARKET_EXIT_ON_FULL_FILL)
+    )
+
+    return {
+        'ask_position_offset': ask_offset,
+        'reposition_delay': reposition_delay,
+        'auto_market_exit_on_full_fill': auto_market_exit_on_full_fill,
+    }
+
+
+def set_user_trade_setting(user_id: str, key: str, value: int) -> int:
+    """Сохранить торговую настройку пользователя и вернуть итоговое значение."""
+    if key == 'ask_position_offset':
+        value = max(SETTINGS_ASK_POSITION_MIN, min(SETTINGS_ASK_POSITION_MAX, int(value)))
+    elif key == 'reposition_delay':
+        value = max(SETTINGS_REPOSITION_DELAY_MIN, min(SETTINGS_REPOSITION_DELAY_MAX, int(value)))
+    else:
+        return int(value)
+
+    ps = bot_state.get_persistent_for_user(user_id)
+    ps.set_setting(key, value)
+    return value
+
+
+def set_user_trade_toggle(user_id: str, key: str, value: bool) -> bool:
+    """Сохранить булевую торговую настройку пользователя."""
+    ps = bot_state.get_persistent_for_user(user_id)
+    ps.set_setting(key, bool(value))
+    return bool(value)
+
+
+def apply_user_trade_settings_to_trader(trader: PredictTrader, user_id: str):
+    """Применить торговые настройки пользователя к экземпляру трейдера."""
+    settings = get_user_trade_settings(user_id)
+    trader.ask_position_offset = settings['ask_position_offset']
+    trader.reposition_delay = settings['reposition_delay']
+    trader.auto_market_exit_on_full_fill = settings['auto_market_exit_on_full_fill']
+
+
+def apply_user_trade_settings_to_running_traders(user_id: str) -> int:
+    """Применить обновлённые настройки ко всем уже созданным трейдерам пользователя.
+    Возвращает количество обновлённых трейдеров."""
+    count = 0
+    for acc in get_accounts_for_user(user_id):
+        trader = bot_state.traders.get(acc.predict_account_address)
+        if trader:
+            apply_user_trade_settings_to_trader(trader, user_id)
+            count += 1
+    return count
+
+
+def build_settings_view(user_id: str):
+    """Текст и клавиатура меню настроек."""
+    trade_settings = get_user_trade_settings(user_id)
+    ask_offset = trade_settings['ask_position_offset']
+    reposition_delay = trade_settings['reposition_delay']
+    auto_market_exit = trade_settings['auto_market_exit_on_full_fill']
+
+    repo_status = "✅ Вкл" if bot_state.repositioning_notifications else "❌ Выкл"
+    err_status = "✅ Вкл" if bot_state.error_notifications else "❌ Выкл"
+
+    text = (
+        "⚙️ *Настройки*\n\n"
+        f"🔔 Уведомления об ошибках: {err_status}\n"
+        f"🔄 Уведомления о переставлении: {repo_status}\n\n"
+        f"🎯 ASK offset: *{ask_offset}* тиков\n"
+        "   _Позиция SELL относительно лучшего ASK_\n\n"
+        f"⏳ Задержка после отмены: *{reposition_delay}* сек\n"
+        "   _Пауза после отмены перед новым ордером_\n\n"
+        f"⚡ Auto market-exit при 100% fill: *{'ВКЛ' if auto_market_exit else 'ВЫКЛ'}*\n"
+        "   _Закрывать вторую сторону по рынку после полного fill первой_\n\n"
+        f"📊 Всего ошибок: {bot_state.error_count}\n"
+    )
+
+    if bot_state.last_error_time:
+        text += f"🕐 Последняя: {bot_state.last_error_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{'❌' if bot_state.error_notifications else '✅'} Ошибки", callback_data="settings_toggle_errors"
+        )],
+        [InlineKeyboardButton(
+            f"{'❌' if bot_state.repositioning_notifications else '✅'} Переставления", callback_data="settings_toggle_repo_notif"
+        )],
+        [InlineKeyboardButton(
+            f"{'✅' if auto_market_exit else '❌'} Auto market-exit (100% fill)", callback_data="settings_toggle_market_exit"
+        )],
+        [
+            InlineKeyboardButton("➖ ASK", callback_data="settings_ask_minus"),
+            InlineKeyboardButton(f"{ask_offset}", callback_data="settings_noop"),
+            InlineKeyboardButton("➕ ASK", callback_data="settings_ask_plus"),
+        ],
+        [
+            InlineKeyboardButton("➖ DELAY", callback_data="settings_delay_minus"),
+            InlineKeyboardButton(f"{reposition_delay}s", callback_data="settings_noop"),
+            InlineKeyboardButton("➕ DELAY", callback_data="settings_delay_plus"),
+        ],
+        [InlineKeyboardButton("✅ Применить", callback_data="settings_apply")],
+        [InlineKeyboardButton("🔄 Сбросить счётчик ошибок", callback_data="settings_reset_errors")],
+        [InlineKeyboardButton("« Главное меню", callback_data="main_menu")]
+    ]
+
+    return text, keyboard
+
+
+def get_all_running_accounts() -> list:
+    """Получить все запущенные аккаунты со всех пользователей (acc, owner_id)"""
+    result = []
+    # Админ
+    for acc in load_accounts():
+        if bot_state.running.get(acc.predict_account_address, False):
+            result.append((acc, TELEGRAM_ADMIN_ID))
+    # Рефералы
+    um = get_user_manager()
+    for user in um.get_active_users():
+        for acc in um.load_user_accounts(user.telegram_id):
+            if bot_state.running.get(acc.predict_account_address, False):
+                result.append((acc, user.telegram_id))
+    return result
+
+
 # =============================================================================
 # ГЛАВНОЕ МЕНЮ
 # =============================================================================
 
-def get_reply_keyboard():
-    """Постоянная клавиатура внизу экрана (всплывающее меню)"""
+def get_reply_keyboard(user_id: str = None):
+    """Постоянная клавиатура внизу экрана (админ видит кнопку Рефералы)"""
+    buttons = [
+        [KeyboardButton("📊 Статус"), KeyboardButton("💰 Баланс")],
+        [KeyboardButton("👥 Аккаунты"), KeyboardButton("📈 Рынки")],
+        [KeyboardButton("🔴 Закрыть"), KeyboardButton("🤖 Бот")],
+        [KeyboardButton("⚙️ Настройки")],
+    ]
+    if user_id and is_admin_user(user_id):
+        buttons.append([KeyboardButton("📋 Рефералы"), KeyboardButton("❓ Как работает?")])
+    else:
+        buttons.append([KeyboardButton("❓ Как работает?")])
     return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("📊 Статус"), KeyboardButton("💰 Баланс")],
-            [KeyboardButton("👥 Аккаунты"), KeyboardButton("📈 Рынки")],
-            [KeyboardButton("⚡ SPLIT"), KeyboardButton("🔴 Закрыть")],
-            [KeyboardButton("🤖 Бот"), KeyboardButton("⚙️ Настройки")],
-            [KeyboardButton("❓ Как работает?")],
-        ],
-        resize_keyboard=True,  # Уменьшить размер кнопок
-        is_persistent=True,  # Всегда показывать
+        buttons,
+        resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -332,21 +617,69 @@ def get_main_menu_keyboard():
     ])
 
 
-@admin_only
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start"""
+    """Команда /start — регистрация / приветствие"""
+    user_id = str(update.effective_user.id)
+    
+    # Админ → полное меню
+    if is_admin_user(user_id):
+        await update.message.reply_text(
+            "🤖 *Predict.fun Trading Bot*\n\n"
+            "Добро пожаловать! Используйте меню внизу для управления ботом.",
+            reply_markup=get_reply_keyboard(user_id),
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Проверяем статус пользователя
+    um = get_user_manager()
+    user = um.get_user(user_id)
+    
+    if user and user.status == 'active':
+        await update.message.reply_text(
+            "🤖 *Predict.fun Trading Bot*\n\n"
+            "Добро пожаловать! Используйте меню внизу для управления ботом.",
+            reply_markup=get_reply_keyboard(user_id),
+            parse_mode='Markdown'
+        )
+        return
+    
+    if user and user.status == 'pending':
+        await update.message.reply_text(
+            "⏳ *Заявка на рассмотрении*\n\n"
+            "Администратор скоро рассмотрит вашу заявку.\n"
+            "Вы получите уведомление.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    if user and user.status == 'disabled':
+        await update.message.reply_text(
+            f"⛔ {DISCONNECT_MESSAGE}",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Новый пользователь → реферальная ссылка + кнопка "Готово"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Реферальная ссылка", url=REFERRAL_LINK)],
+        [InlineKeyboardButton("✅ Готово", callback_data="register_done")],
+    ])
     await update.message.reply_text(
-        "🤖 *Predict.fun Trading Bot*\n\n"
-        "Добро пожаловать! Используйте меню внизу для управления ботом.",
-        reply_markup=get_reply_keyboard(),
+        "👋 *Добро пожаловать!*\n\n"
+        "Чтобы пользоваться ботом, нужно быть рефералом.\n\n"
+        "1️⃣ Перейдите по реферальной ссылке\n"
+        "2️⃣ Нажмите «Готово»",
+        reply_markup=keyboard,
         parse_mode='Markdown'
     )
 
 
-@admin_only
+@authorized_user
 async def handle_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик любого текстового сообщения - обрабатывает кнопки Reply Keyboard"""
     text = update.message.text.strip()
+    user_id = str(update.effective_user.id)
     
     # Обработка кнопок Reply Keyboard
     if text == "📊 Статус":
@@ -361,14 +694,11 @@ async def handle_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "📈 Рынки":
         await cmd_markets(update, context)
         return
-    elif text == "⚡ SPLIT":
-        await cmd_split(update, context)
-        return
     elif text == "🔴 Закрыть":
         # Показываем меню закрытия позиций
-        accounts = load_accounts()
+        accounts = get_accounts_for_user(user_id)
         if not accounts:
-            await update.message.reply_text("📭 Нет аккаунтов", reply_markup=get_reply_keyboard())
+            await update.message.reply_text("📭 Нет аккаунтов", reply_markup=get_reply_keyboard(user_id))
             return
         keyboard = []
         for i, acc in enumerate(accounts):
@@ -381,8 +711,9 @@ async def handle_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     elif text == "🤖 Бот":
         # Показываем меню управления ботом
-        running_count = sum(1 for v in bot_state.running.values() if v)
-        total_count = len(load_accounts())
+        accounts = get_accounts_for_user(user_id)
+        running_count = sum(1 for acc in accounts if bot_state.running.get(acc.predict_account_address, False))
+        total_count = len(accounts)
         
         last_restart = bot_state.last_restart_time
         if last_restart:
@@ -406,18 +737,9 @@ async def handle_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     elif text == "⚙️ Настройки":
         # Показываем меню настроек
-        keyboard = [
-            [InlineKeyboardButton(
-                f"{'✅' if bot_state.error_notifications else '❌'} Уведомления об ошибках",
-                callback_data="settings_toggle_errors"
-            )],
-            [InlineKeyboardButton(
-                f"{'✅' if bot_state.repositioning_notifications else '❌'} Уведомления о репозиционировании",
-                callback_data="settings_toggle_repositioning"
-            )],
-        ]
+        text_settings, keyboard = build_settings_view(user_id)
         await update.message.reply_text(
-            "⚙️ *Настройки*\n\nНажмите чтобы переключить:",
+            text_settings,
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
@@ -425,15 +747,18 @@ async def handle_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "❓ Как работает?":
         await cmd_help(update, context)
         return
+    elif text == "📋 Рефералы" and is_admin_user(user_id):
+        await cmd_referrals(update, context)
+        return
     
     # Для любого другого текста - просто показываем подсказку
     await update.message.reply_text(
         "👆 Используйте меню внизу для управления ботом",
-        reply_markup=get_reply_keyboard()
+        reply_markup=get_reply_keyboard(user_id)
     )
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Возврат в главное меню - просто удаляем inline сообщение"""
     query = update.callback_query
@@ -444,7 +769,7 @@ async def callback_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопок главного меню"""
     query = update.callback_query
@@ -488,7 +813,8 @@ async def callback_ignore(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_status(query):
     """Показать статус"""
-    accounts = load_accounts()
+    user_id = str(query.from_user.id)
+    accounts = get_accounts_for_user(user_id)
     
     text = "📊 *Статус бота*\n\n"
     text += f"🔗 Сеть: {'BNB Mainnet' if CHAIN_ID == ChainId.BNB_MAINNET else 'Testnet'}\n"
@@ -516,7 +842,8 @@ async def show_status(query):
 
 async def show_balance(query):
     """Показать баланс"""
-    accounts = load_accounts()
+    user_id = str(query.from_user.id)
+    accounts = get_accounts_for_user(user_id)
     
     if not accounts:
         keyboard = [[InlineKeyboardButton("« Главное меню", callback_data="main_menu")]]
@@ -533,13 +860,27 @@ async def show_balance(query):
     for acc in accounts:
         addr_short = f"{acc.predict_account_address[:6]}...{acc.predict_account_address[-4:]}"
         try:
-            trader = await asyncio.to_thread(get_or_create_trader, acc)
+            user_id = str(query.from_user.id)
+            trader = await asyncio.to_thread(get_or_create_trader, acc, user_id)
             if trader:
                 if not trader.order_builder:
                     await asyncio.to_thread(trader.init_sdk)
                 balance = await asyncio.to_thread(trader.get_usdt_balance)
+
+                # Пытаемся получить реальные PP через /v1/account (нужен JWT)
+                points_text = "н/д"
+                if not trader.api.jwt_token:
+                    await asyncio.to_thread(trader.authenticate)
+                points_value = await asyncio.to_thread(trader.get_predict_points)
+                if points_value is not None:
+                    points_text = f"{points_value:,.1f} PP"
+                else:
+                    est_points = await asyncio.to_thread(trader.points.estimate_points)
+                    points_text = f"~{est_points:,.1f} PP"
+
                 text += f"👤 *{acc.name}* ({addr_short})\n"
                 text += f"   💵 ${balance:.2f} USDT\n\n"
+                text += f"   💎 {points_text}\n\n"
             else:
                 text += f"👤 *{acc.name}* - ❌ ошибка\n\n"
         except Exception as e:
@@ -550,94 +891,510 @@ async def show_balance(query):
 
 
 # =============================================================================
-# МЕНЮ: ПОМОЩЬ
-# =============================================================================
-
-# =============================================================================
 # МЕНЮ: НАСТРОЙКИ
 # =============================================================================
 
 async def show_settings(query):
     """Показать настройки"""
-    repo_status = "✅ Вкл" if bot_state.repositioning_notifications else "❌ Выкл"
-    
-    text = (
-        "⚙️ *Настройки*\n\n"
-        f"🔔 Уведомления о переставлении: {repo_status}\n"
-        "   _Уведомляет когда ордера переставляются_\n\n"
-        f"📊 Всего ошибок: {bot_state.error_count}\n"
-    )
-    
-    if bot_state.last_error_time:
-        text += f"🕐 Последняя: {bot_state.last_error_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-    
-    keyboard = [
-        [InlineKeyboardButton(
-            f"{'🔕 Выключить' if bot_state.repositioning_notifications else '🔔 Включить'} уведомления о переставлении",
-            callback_data="settings_toggle_repo_notif"
-        )],
-        [InlineKeyboardButton("🔄 Сбросить счётчик ошибок", callback_data="settings_reset_errors")],
-        [InlineKeyboardButton("« Главное меню", callback_data="main_menu")]
-    ]
-    
+    user_id = str(query.from_user.id)
+    text, keyboard = build_settings_view(user_id)
+
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик настроек"""
     query = update.callback_query
     await query.answer()
+    user_id = str(update.effective_user.id)
     
     action = query.data.replace("settings_", "")
+
+    if action == "noop":
+        return
     
     if action == "toggle_repo_notif" or action == "toggle_repositioning":
         bot_state.repositioning_notifications = not bot_state.repositioning_notifications
+        bot_state.save_settings()
         status = "включены" if bot_state.repositioning_notifications else "выключены"
         await query.answer(f"Уведомления о переставлении {status}")
-        # Показываем обновлённое меню настроек
-        keyboard = [
-            [InlineKeyboardButton(
-                f"{'✅' if bot_state.error_notifications else '❌'} Уведомления об ошибках",
-                callback_data="settings_toggle_errors"
-            )],
-            [InlineKeyboardButton(
-                f"{'✅' if bot_state.repositioning_notifications else '❌'} Уведомления о репозиционировании",
-                callback_data="settings_toggle_repositioning"
-            )],
-        ]
-        await query.edit_message_text(
-            "⚙️ *Настройки*\n\nНажмите чтобы переключить:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
+        text, keyboard = build_settings_view(user_id)
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     
     elif action == "toggle_errors":
         bot_state.error_notifications = not bot_state.error_notifications
+        bot_state.save_settings()
         status = "включены" if bot_state.error_notifications else "выключены"
         await query.answer(f"Уведомления об ошибках {status}")
-        # Показываем обновлённое меню настроек
-        keyboard = [
-            [InlineKeyboardButton(
-                f"{'✅' if bot_state.error_notifications else '❌'} Уведомления об ошибках",
-                callback_data="settings_toggle_errors"
-            )],
-            [InlineKeyboardButton(
-                f"{'✅' if bot_state.repositioning_notifications else '❌'} Уведомления о репозиционировании",
-                callback_data="settings_toggle_repositioning"
-            )],
-        ]
-        await query.edit_message_text(
-            "⚙️ *Настройки*\n\nНажмите чтобы переключить:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
+        text, keyboard = build_settings_view(user_id)
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    elif action == "toggle_market_exit":
+        settings = get_user_trade_settings(user_id)
+        current = settings['auto_market_exit_on_full_fill']
+        value = set_user_trade_toggle(user_id, 'auto_market_exit_on_full_fill', not current)
+        apply_user_trade_settings_to_running_traders(user_id)
+        await query.answer(
+            "Auto market-exit: ВКЛ" if value else "Auto market-exit: ВЫКЛ"
         )
-    
+        text, keyboard = build_settings_view(user_id)
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    elif action == "ask_minus" or action == "ask_plus":
+        settings = get_user_trade_settings(user_id)
+        current = settings['ask_position_offset']
+        delta = -SETTINGS_ASK_STEP if action == "ask_minus" else SETTINGS_ASK_STEP
+        value = set_user_trade_setting(user_id, 'ask_position_offset', current + delta)
+        apply_user_trade_settings_to_running_traders(user_id)
+        await query.answer(f"ASK_POSITION_OFFSET: {value}")
+        text, keyboard = build_settings_view(user_id)
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    elif action == "delay_minus" or action == "delay_plus":
+        settings = get_user_trade_settings(user_id)
+        current = settings['reposition_delay']
+        delta = -SETTINGS_DELAY_STEP if action == "delay_minus" else SETTINGS_DELAY_STEP
+        value = set_user_trade_setting(user_id, 'reposition_delay', current + delta)
+        apply_user_trade_settings_to_running_traders(user_id)
+        await query.answer(f"REPOSITION_DELAY: {value}с")
+        text, keyboard = build_settings_view(user_id)
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    elif action == "apply":
+        count = apply_user_trade_settings_to_running_traders(user_id)
+        if count > 0:
+            await query.answer(f"✅ Настройки применены к {count} трейдерам!", show_alert=True)
+        else:
+            await query.answer("ℹ️ Нет активных трейдеров для обновления", show_alert=True)
+        text, keyboard = build_settings_view(user_id)
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
     elif action == "reset_errors":
         bot_state.error_count = 0
         bot_state.last_error_time = None
         await query.answer("Счётчик ошибок сброшен")
         await show_settings(query)
+
+
+# =============================================================================
+# РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЕЙ
+# =============================================================================
+
+async def callback_register_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пользователь нажал 'Готово' после перехода по реф. ссылке"""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = str(query.from_user.id)
+    username = query.from_user.username or ""
+    first_name = query.from_user.first_name or ""
+
+    um = get_user_manager()
+    user = um.get_user(user_id)
+
+    if user:
+        if user.status == 'active':
+            await query.edit_message_text("✅ Вы уже зарегистрированы! Нажмите /start")
+            return
+        if user.status == 'pending':
+            await query.edit_message_text("⏳ Ваша заявка уже на рассмотрении.")
+            return
+        if user.status == 'disabled':
+            await query.edit_message_text(f"⛔ {DISCONNECT_MESSAGE}")
+            return
+
+    # Создаём заявку
+    um.add_pending_user(user_id, f"@{username}" if username else "", first_name)
+
+    await query.edit_message_text(
+        "✅ *Заявка отправлена!*\n\n"
+        "Администратор рассмотрит вашу заявку.\n"
+        "Вы получите уведомление о решении.",
+        parse_mode='Markdown'
+    )
+
+    # Уведомляем админа
+    if TELEGRAM_ADMIN_ID and bot_state.app:
+        display_name = first_name or "Неизвестный"
+        if username:
+            display_name += f" (@{username})"
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Подключить", callback_data=f"admin_approve_{user_id}"),
+                InlineKeyboardButton("❌ Отклонить", callback_data=f"admin_reject_{user_id}"),
+            ]
+        ])
+
+        try:
+            await bot_state.app.bot.send_message(
+                chat_id=int(TELEGRAM_ADMIN_ID),
+                text=(
+                    f"🆕 *Новая заявка на подключение*\n\n"
+                    f"👤 {display_name}\n"
+                    f"🆔 ID: `{user_id}`\n"
+                    f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                ),
+                reply_markup=keyboard,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify admin about new user: {e}")
+
+
+@admin_only_callback
+async def callback_admin_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админ одобряет заявку пользователя"""
+    query = update.callback_query
+    await query.answer()
+
+    target_id = query.data.replace("admin_approve_", "")
+    um = get_user_manager()
+
+    if um.approve_user(target_id):
+        user = um.get_user(target_id)
+        await query.edit_message_text(
+            f"✅ Пользователь {user.display_name} подключен!",
+        )
+        # Уведомляем пользователя
+        try:
+            await bot_state.app.bot.send_message(
+                chat_id=int(target_id),
+                text=(
+                    "🎉 *Заявка одобрена!*\n\n"
+                    "Добро пожаловать! Нажмите /start чтобы начать."
+                ),
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify approved user: {e}")
+    else:
+        await query.edit_message_text("❌ Пользователь не найден")
+
+
+@admin_only_callback
+async def callback_admin_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админ отклоняет заявку"""
+    query = update.callback_query
+    await query.answer()
+
+    target_id = query.data.replace("admin_reject_", "")
+    um = get_user_manager()
+
+    user = um.get_user(target_id)
+    if user:
+        um.delete_user(target_id)
+        await query.edit_message_text(f"❌ Заявка {user.display_name} отклонена")
+        try:
+            await bot_state.app.bot.send_message(
+                chat_id=int(target_id),
+                text="❌ Ваша заявка отклонена.",
+            )
+        except Exception:
+            pass
+    else:
+        await query.edit_message_text("❌ Пользователь не найден")
+
+
+# =============================================================================
+# АДМИН-ПАНЕЛЬ: РЕФЕРАЛЫ
+# =============================================================================
+
+@admin_only
+async def cmd_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать список рефералов (только для админа)"""
+    um = get_user_manager()
+    users = um.get_all_users()
+
+    if not users:
+        await update.message.reply_text(
+            "📋 *Рефералы*\n\nПока нет рефералов.",
+            parse_mode='Markdown'
+        )
+        return
+
+    text = f"📋 *Рефералы ({len(users)})*\n\nВыберите для управления:"
+    keyboard = []
+    for user in users:
+        status_emoji = {"active": "✅", "pending": "⏳", "disabled": "⛔"}.get(user.status, "❓")
+        display = user.display_name
+        keyboard.append([
+            InlineKeyboardButton(f"{status_emoji} {display}", callback_data=f"ref_info_{user.telegram_id}")
+        ])
+    keyboard.append([InlineKeyboardButton("« Главное меню", callback_data="main_menu")])
+
+    await update.message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+
+@admin_only_callback
+async def callback_ref_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список рефералов (inline callback)"""
+    query = update.callback_query
+    await query.answer()
+
+    um = get_user_manager()
+    users = um.get_all_users()
+
+    if not users:
+        keyboard = [[InlineKeyboardButton("« Главное меню", callback_data="main_menu")]]
+        await query.edit_message_text(
+            "📋 *Рефералы*\n\nПока нет рефералов.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        return
+
+    text = f"📋 *Рефералы ({len(users)})*\n\nВыберите для управления:"
+    keyboard = []
+    for user in users:
+        status_emoji = {"active": "✅", "pending": "⏳", "disabled": "⛔"}.get(user.status, "❓")
+        display = user.display_name
+        keyboard.append([
+            InlineKeyboardButton(f"{status_emoji} {display}", callback_data=f"ref_info_{user.telegram_id}")
+        ])
+    keyboard.append([InlineKeyboardButton("« Главное меню", callback_data="main_menu")])
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+
+@admin_only_callback
+async def callback_ref_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Детальная информация о реферале"""
+    query = update.callback_query
+    await query.answer()
+
+    target_id = query.data.replace("ref_info_", "")
+    um = get_user_manager()
+    user = um.get_user(target_id)
+
+    if not user:
+        await query.edit_message_text("❌ Пользователь не найден")
+        return
+
+    status_text = {
+        "active": "✅ Активен", "pending": "⏳ Ожидает", "disabled": "⛔ Отключен"
+    }.get(user.status, "❓")
+
+    accounts = um.load_user_accounts(target_id)
+    running_count = sum(
+        1 for acc in accounts
+        if bot_state.running.get(acc.predict_account_address, False)
+    )
+    trade_settings = get_user_trade_settings(target_id)
+
+    # Баланс
+    balance_text = ""
+    for acc in accounts:
+        try:
+            trader = PredictTrader(market_ids=None, monitor_mode=True, account=acc)
+            if await asyncio.to_thread(trader.init_sdk):
+                balance = await asyncio.to_thread(trader.get_usdt_balance)
+                balance_text += f"\n   💵 {md(acc.name)}: ${balance:.2f}"
+        except Exception:
+            balance_text += f"\n   💵 {md(acc.name)}: ❌"
+
+    safe_display_name = md(user.display_name)
+
+    text = (
+        f"👤 *{safe_display_name}*\n"
+        f"🆔 `{user.telegram_id}`\n\n"
+        f"📊 Статус: {status_text}\n"
+        f"📅 Присоединился: {user.joined_at[:10] if user.joined_at else 'N/A'}\n"
+        f"👥 Аккаунтов: {len(accounts)}\n"
+        f"🟢 Запущено: {running_count}\n"
+        f"🎯 ASK offset: {trade_settings['ask_position_offset']}\n"
+        f"⏳ Задержка после отмены: {trade_settings['reposition_delay']}с"
+    )
+    if balance_text:
+        text += f"\n{balance_text}"
+
+    keyboard = []
+    if user.status == 'active':
+        keyboard.append([InlineKeyboardButton("⛔ Отключить", callback_data=f"ref_disable_{target_id}")])
+    elif user.status == 'disabled':
+        keyboard.append([InlineKeyboardButton("✅ Подключить", callback_data=f"ref_enable_{target_id}")])
+    elif user.status == 'pending':
+        keyboard.append([
+            InlineKeyboardButton("✅ Одобрить", callback_data=f"admin_approve_{target_id}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"admin_reject_{target_id}"),
+        ])
+
+    keyboard.append([InlineKeyboardButton("� Логи", callback_data=f"ref_logs_{target_id}")])
+    keyboard.append([InlineKeyboardButton("�🗑 Удалить", callback_data=f"ref_delete_{target_id}")])
+    keyboard.append([InlineKeyboardButton("« К рефералам", callback_data="ref_list")])
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+
+@admin_only_callback
+async def callback_ref_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр логов реферала (последние события переставления ордеров)"""
+    query = update.callback_query
+    await query.answer()
+
+    target_id = query.data.replace("ref_logs_", "")
+    um = get_user_manager()
+    user = um.get_user(target_id)
+
+    if not user:
+        await query.edit_message_text("❌ Пользователь не найден")
+        return
+
+    events = bot_state.get_user_events(target_id, limit=30)
+
+    safe_name = md(user.display_name)
+    if not events:
+        text = (
+            f"📋 *Логи: {safe_name}*\n\n"
+            "Нет событий. Логи появятся после старта бота "
+            "и активных переставлений ордеров."
+        )
+    else:
+        lines = [f"📋 *Логи: {safe_name}*", f"Последние {len(events)} событий:", ""]
+        for event in events:
+            time_str = event['time']
+            msg = md(event['message'])
+            if event['type'] == 'reposition':
+                lines.append(f"🔄 `{time_str}` {msg}")
+            elif event['type'] == 'error':
+                lines.append(f"🚨 `{time_str}` {msg}")
+            else:
+                lines.append(f"ℹ️ `{time_str}` {msg}")
+        text = "\n".join(lines)
+
+    keyboard = [
+        [InlineKeyboardButton("🔄 Обновить", callback_data=f"ref_logs_{target_id}")],
+        [InlineKeyboardButton("« К рефералу", callback_data=f"ref_info_{target_id}")],
+    ]
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+
+@admin_only_callback
+async def callback_ref_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отключить реферала"""
+    query = update.callback_query
+    await query.answer()
+
+    target_id = query.data.replace("ref_disable_", "")
+    um = get_user_manager()
+    user = um.get_user(target_id)
+
+    if not user:
+        await query.edit_message_text("❌ Пользователь не найден")
+        return
+
+    # Останавливаем трейдеров пользователя
+    user_accounts = um.load_user_accounts(target_id)
+    for acc in user_accounts:
+        if bot_state.running.get(acc.predict_account_address, False):
+            await stop_monitoring(acc)
+
+    um.disable_user(target_id)
+
+    await query.edit_message_text(f"⛔ Пользователь {user.display_name} отключен")
+
+    # Уведомляем пользователя
+    try:
+        await bot_state.app.bot.send_message(
+            chat_id=int(target_id),
+            text=f"⛔ {DISCONNECT_MESSAGE}",
+        )
+    except Exception:
+        pass
+
+
+@admin_only_callback
+async def callback_ref_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Включить реферала обратно"""
+    query = update.callback_query
+    await query.answer()
+
+    target_id = query.data.replace("ref_enable_", "")
+    um = get_user_manager()
+
+    if um.enable_user(target_id):
+        user = um.get_user(target_id)
+        await query.edit_message_text(f"✅ Пользователь {user.display_name} подключен обратно")
+        try:
+            await bot_state.app.bot.send_message(
+                chat_id=int(target_id),
+                text="✅ Ваш доступ к боту восстановлен! Нажмите /start",
+            )
+        except Exception:
+            pass
+    else:
+        await query.edit_message_text("❌ Пользователь не найден")
+
+
+@admin_only_callback
+async def callback_ref_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение удаления реферала"""
+    query = update.callback_query
+    await query.answer()
+
+    target_id = query.data.replace("ref_delete_", "")
+    um = get_user_manager()
+    user = um.get_user(target_id)
+
+    if not user:
+        await query.edit_message_text("❌ Пользователь не найден")
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Да, удалить", callback_data=f"ref_confirm_delete_{target_id}"),
+            InlineKeyboardButton("❌ Отмена", callback_data=f"ref_info_{target_id}"),
+        ]
+    ])
+
+    await query.edit_message_text(
+        f"⚠️ Удалить пользователя *{user.display_name}*?\n\n"
+        "Все его данные будут утеряны!",
+        reply_markup=keyboard,
+        parse_mode='Markdown'
+    )
+
+
+@admin_only_callback
+async def callback_ref_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждённое удаление реферала"""
+    query = update.callback_query
+    await query.answer()
+
+    target_id = query.data.replace("ref_confirm_delete_", "")
+    um = get_user_manager()
+    user = um.get_user(target_id)
+
+    if not user:
+        await query.edit_message_text("❌ Пользователь не найден")
+        return
+
+    # Останавливаем трейдеров
+    user_accounts = um.load_user_accounts(target_id)
+    for acc in user_accounts:
+        if bot_state.running.get(acc.predict_account_address, False):
+            await stop_monitoring(acc)
+
+    display = user.display_name
+    um.delete_user(target_id)
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("« К рефералам", callback_data="ref_list")]
+    ])
+    await query.edit_message_text(
+        f"🗑 Пользователь {display} удалён",
+        reply_markup=keyboard
+    )
 
 
 # =============================================================================
@@ -673,7 +1430,8 @@ async def show_help(query):
 
 async def show_accounts(query):
     """Показать список аккаунтов"""
-    accounts = load_accounts()
+    user_id = str(query.from_user.id)
+    accounts = get_accounts_for_user(user_id)
     
     keyboard = []
     
@@ -699,7 +1457,8 @@ async def show_accounts(query):
 
 async def show_markets(query, context):
     """Показать рынки из портфолио (с позициями/ордерами)"""
-    accounts = load_accounts()
+    user_id = str(query.from_user.id)
+    accounts = get_accounts_for_user(user_id)
     
     if not accounts:
         keyboard = [[InlineKeyboardButton("« Главное меню", callback_data="main_menu")]]
@@ -891,7 +1650,8 @@ async def show_market_details(query, context, market_id: int):
 
 async def show_close_position(query, context):
     """Показать меню закрытия позиции"""
-    accounts = load_accounts()
+    user_id = str(query.from_user.id)
+    accounts = get_accounts_for_user(user_id)
     
     if not accounts:
         keyboard = [[InlineKeyboardButton("« Главное меню", callback_data="main_menu")]]
@@ -1000,14 +1760,15 @@ async def show_close_markets(query, context, acc: AccountConfig):
         await query.edit_message_text(f"❌ Ошибка: {e}", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_close_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выбор аккаунта для закрытия"""
     query = update.callback_query
     await query.answer()
     
+    user_id = str(update.effective_user.id)
     acc_idx = int(query.data.split('_')[-1])
-    accounts = load_accounts()
+    accounts = get_accounts_for_user(user_id)
     
     if acc_idx >= len(accounts):
         await query.edit_message_text("❌ Аккаунт не найден")
@@ -1017,7 +1778,7 @@ async def callback_close_account(update: Update, context: ContextTypes.DEFAULT_T
     await show_close_markets(query, context, accounts[acc_idx])
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_close_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Подтверждение закрытия рынка"""
     query = update.callback_query
@@ -1054,16 +1815,17 @@ async def callback_close_market(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_close_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выполнение закрытия позиции"""
     query = update.callback_query
     await query.answer()
     
+    user_id = str(update.effective_user.id)
     market_id = int(query.data.split('_')[-1])
     acc_idx = context.user_data.get('close_account_idx', 0)
     
-    accounts = load_accounts()
+    accounts = get_accounts_for_user(user_id)
     if acc_idx >= len(accounts):
         await query.edit_message_text("❌ Аккаунт не найден")
         return
@@ -1139,7 +1901,7 @@ async def callback_close_confirm(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text(f"❌ Ошибка: {e}", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_close_all_markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Подтверждение закрытия всех позиций"""
     query = update.callback_query
@@ -1171,16 +1933,17 @@ async def callback_close_all_markets(update: Update, context: ContextTypes.DEFAU
     )
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_close_all_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выполнение закрытия всех позиций"""
     query = update.callback_query
     await query.answer()
     
+    user_id = str(update.effective_user.id)
     acc_idx = context.user_data.get('close_account_idx', 0)
     markets_data = context.user_data.get('close_markets', {})
     
-    accounts = load_accounts()
+    accounts = get_accounts_for_user(user_id)
     if acc_idx >= len(accounts):
         await query.edit_message_text("❌ Аккаунт не найден")
         return
@@ -1267,7 +2030,8 @@ async def callback_close_all_confirm(update: Update, context: ContextTypes.DEFAU
 
 async def show_restart(query, context):
     """Показать меню перезагрузки"""
-    accounts = load_accounts()
+    user_id = str(query.from_user.id)
+    accounts = get_accounts_for_user(user_id)
     running_count = sum(1 for acc in accounts if bot_state.running.get(acc.predict_account_address, False))
     
     last_restart = "Никогда"
@@ -1290,7 +2054,7 @@ async def show_restart(query, context):
     )
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_restart_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Перезагрузить бота прямо сейчас"""
     query = update.callback_query
@@ -1314,14 +2078,16 @@ async def callback_restart_now(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def restart_all_traders(context, manual: bool = False):
-    """Перезагрузить всех трейдеров"""
-    accounts = load_accounts()
-    
-    # Сохраняем список запущенных аккаунтов
-    running_accounts = [acc for acc in accounts if bot_state.running.get(acc.predict_account_address, False)]
+    """Перезагрузить всех трейдеров (все пользователи)"""
+    # Собираем все запущенные аккаунты со владельцами
+    running_entries = []  # (acc, owner_id)
+    all_running = get_all_running_accounts()
+    for acc, owner_id in all_running:
+        if bot_state.running.get(acc.predict_account_address, False):
+            running_entries.append((acc, owner_id))
     
     # Останавливаем всех
-    for acc in running_accounts:
+    for acc, owner_id in running_entries:
         addr = acc.predict_account_address
         if addr in bot_state.tasks:
             bot_state.tasks[addr].cancel()
@@ -1338,28 +2104,31 @@ async def restart_all_traders(context, manual: bool = False):
     
     # Запускаем заново
     restarted = 0
-    for acc in running_accounts:
+    for acc, owner_id in running_entries:
         try:
-            if await start_monitoring(acc, context):
+            if await start_monitoring(acc, context, owner_id=owner_id):
                 restarted += 1
         except Exception as e:
             logger.error(f"Failed to restart {acc.name}: {e}")
     
     bot_state.last_restart_time = datetime.now()
     
-    # Отправляем уведомление
+    # Отправляем уведомление админу
     if not manual:
-        await bot_state.app.bot.send_message(
-            chat_id=int(TELEGRAM_ADMIN_ID),
-            text=(
-                f"🔄 *Автоматическая перезагрузка*\n\n"
-                f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"📊 Перезапущено: {restarted} аккаунтов\n\n"
-                f"_Следующая перезагрузка через 3 часа_"
-            ),
-            parse_mode='Markdown',
-            disable_notification=True  # Тихое уведомление
-        )
+        try:
+            await bot_state.app.bot.send_message(
+                chat_id=int(TELEGRAM_ADMIN_ID),
+                text=(
+                    f"🔄 *Автоматическая перезагрузка*\n\n"
+                    f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"📊 Перезапущено: {restarted} аккаунтов\n\n"
+                    f"_Следующая перезагрузка через 1 час_"
+                ),
+                parse_mode='Markdown',
+                disable_notification=True  # Тихое уведомление
+            )
+        except Exception as e:
+            logger.error(f"Failed to send restart notification: {e}")
     
     logger.info(f"Restarted {restarted} traders")
     return restarted
@@ -1491,7 +2260,8 @@ async def scheduled_auto_update(context):
 
 async def show_split(query):
     """Показать меню SPLIT"""
-    accounts = load_accounts()
+    user_id = str(query.from_user.id)
+    accounts = get_accounts_for_user(user_id)
     
     if not accounts:
         keyboard = [[InlineKeyboardButton("« Главное меню", callback_data="main_menu")]]
@@ -1522,7 +2292,8 @@ async def show_split(query):
 
 async def show_start_bot(query, context):
     """Показать меню запуска бота"""
-    accounts = load_accounts()
+    user_id = str(query.from_user.id)
+    accounts = get_accounts_for_user(user_id)
     
     if not accounts:
         keyboard = [[InlineKeyboardButton("« Главное меню", callback_data="main_menu")]]
@@ -1552,7 +2323,8 @@ async def show_start_bot(query, context):
 
 async def show_stop_bot(query):
     """Показать меню остановки бота"""
-    accounts = load_accounts()
+    user_id = str(query.from_user.id)
+    accounts = get_accounts_for_user(user_id)
     running_accounts = [acc for acc in accounts if bot_state.running.get(acc.predict_account_address, False)]
     
     if not running_accounts:
@@ -1584,7 +2356,7 @@ async def show_stop_bot(query):
 # КОМАНДЫ (оставляем для совместимости)
 # =============================================================================
 
-@admin_only
+@authorized_user
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /help"""
     await update.message.reply_text(
@@ -1612,10 +2384,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-@admin_only
+@authorized_user
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /status - показать статус"""
-    accounts = load_accounts()
+    user_id = str(update.effective_user.id)
+    accounts = get_accounts_for_user(user_id)
     
     text = "📊 *Статус бота*\n\n"
     text += f"🔗 Сеть: {'BNB Mainnet' if CHAIN_ID == ChainId.BNB_MAINNET else 'Testnet'}\n"
@@ -1637,10 +2410,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 
-@admin_only
+@authorized_user
 async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /accounts - управление аккаунтами"""
-    accounts = load_accounts()
+    user_id = str(update.effective_user.id)
+    accounts = get_accounts_for_user(user_id)
     
     keyboard = []
     
@@ -1659,14 +2433,15 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_account_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Информация об аккаунте"""
     query = update.callback_query
     await query.answer()
     
+    user_id = str(update.effective_user.id)
     acc_idx = int(query.data.split('_')[-1])
-    accounts = load_accounts()
+    accounts = get_accounts_for_user(user_id)
     
     if acc_idx >= len(accounts):
         await query.edit_message_text("❌ Аккаунт не найден")
@@ -1703,14 +2478,15 @@ async def callback_account_info(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_account_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Запуск/остановка аккаунта"""
     query = update.callback_query
     await query.answer()
     
+    user_id = str(update.effective_user.id)
     acc_idx = int(query.data.split('_')[-1])
-    accounts = load_accounts()
+    accounts = get_accounts_for_user(user_id)
     
     if acc_idx >= len(accounts):
         await query.edit_message_text("❌ Аккаунт не найден")
@@ -1726,21 +2502,22 @@ async def callback_account_toggle(update: Update, context: ContextTypes.DEFAULT_
     else:
         # Запускаем
         await query.edit_message_text(f"▶️ Запускаем мониторинг для *{acc.name}*...", parse_mode='Markdown')
-        success = await start_monitoring(acc, context)
+        success = await start_monitoring(acc, context, owner_id=user_id)
         if success:
             await query.edit_message_text(f"✅ Мониторинг для *{acc.name}* запущен!", parse_mode='Markdown')
         else:
             await query.edit_message_text(f"❌ Ошибка запуска для *{acc.name}*", parse_mode='Markdown')
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_account_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удаление аккаунта"""
     query = update.callback_query
     await query.answer()
     
+    user_id = str(update.effective_user.id)
     acc_idx = int(query.data.split('_')[-1])
-    accounts = load_accounts()
+    accounts = get_accounts_for_user(user_id)
     
     if acc_idx >= len(accounts):
         await query.edit_message_text("❌ Аккаунт не найден")
@@ -1762,14 +2539,15 @@ async def callback_account_delete(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_account_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Подтверждение удаления"""
     query = update.callback_query
     await query.answer()
     
+    user_id = str(update.effective_user.id)
     acc_idx = int(query.data.split('_')[-1])
-    accounts = load_accounts()
+    accounts = get_accounts_for_user(user_id)
     
     if acc_idx >= len(accounts):
         await query.edit_message_text("❌ Аккаунт не найден")
@@ -1782,12 +2560,12 @@ async def callback_account_confirm_delete(update: Update, context: ContextTypes.
     
     # Удаляем
     accounts.pop(acc_idx)
-    save_accounts(accounts)
+    save_accounts_for_user(user_id, accounts)
     
     await query.edit_message_text(f"🗑 Аккаунт *{acc.name}* удалён", parse_mode='Markdown')
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начало добавления аккаунта"""
     query = update.callback_query
@@ -1860,9 +2638,17 @@ async def handle_account_address(update: Update, context: ContextTypes.DEFAULT_T
     )
     
     # Сохраняем
-    accounts = load_accounts()
+    user_id = str(update.effective_user.id)
+    accounts = get_accounts_for_user(user_id)
+    
+    # Лимит аккаунтов для рефералов
+    if not is_admin_user(user_id) and len(accounts) >= MAX_USER_ACCOUNTS:
+        await update.message.reply_text(f"❌ Максимум {MAX_USER_ACCOUNTS} аккаунт(ов).")
+        context.user_data.clear()
+        return ConversationHandler.END
+    
     accounts.append(new_account)
-    save_accounts(accounts)
+    save_accounts_for_user(user_id, accounts)
     
     # Очищаем данные
     context.user_data.clear()
@@ -1885,14 +2671,15 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_back_to_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Возврат к списку аккаунтов"""
     query = update.callback_query
     await query.answer()
     
     # Эмулируем /accounts
-    accounts = load_accounts()
+    user_id = str(update.effective_user.id)
+    accounts = get_accounts_for_user(user_id)
     
     keyboard = []
     for i, acc in enumerate(accounts):
@@ -1913,10 +2700,11 @@ async def callback_back_to_accounts(update: Update, context: ContextTypes.DEFAUL
     )
 
 
-@admin_only
+@authorized_user
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /balance - показать балансы"""
-    accounts = load_accounts()
+    user_id = str(update.effective_user.id)
+    accounts = get_accounts_for_user(user_id)
     
     if not accounts:
         await update.message.reply_text("📭 Нет аккаунтов. Добавьте через /accounts")
@@ -1928,64 +2716,556 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     for acc in accounts:
         try:
-            trader = get_or_create_trader(acc)
+            trader = get_or_create_trader(acc, user_id)
             if trader and await asyncio.to_thread(trader.init_sdk):
                 balance = await asyncio.to_thread(trader.get_usdt_balance)
-                text += f"• {acc.name}: *${balance:.2f}* USDT\n"
+
+                points_text = "н/д"
+                if not trader.api.jwt_token:
+                    await asyncio.to_thread(trader.authenticate)
+                points_value = await asyncio.to_thread(trader.get_predict_points)
+                if points_value is not None:
+                    points_text = f"{points_value:,.1f} PP"
+                else:
+                    est_points = await asyncio.to_thread(trader.points.estimate_points)
+                    points_text = f"~{est_points:,.1f} PP"
+
+                text += f"• {md(acc.name)}: *${balance:.2f}* USDT\n"
+                text += f"  💎 {md(points_text)}\n"
             else:
-                text += f"• {acc.name}: ❌ Ошибка\n"
+                text += f"• {md(acc.name)}: ❌ Ошибка\n"
         except Exception as e:
-            text += f"• {acc.name}: ❌ {str(e)[:30]}\n"
+            text += f"• {md(acc.name)}: ❌ {md(str(e)[:30])}\n"
     
     await msg.edit_text(text, parse_mode='Markdown')
 
 
-@admin_only
+@authorized_user
 async def cmd_markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /markets - активные рынки для ВСЕХ аккаунтов"""
-    accounts = load_accounts()
+    """Команда /markets - меню рынков: обзор и мои позиции"""
+    user_id = str(update.effective_user.id)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌍 Обзор рынков", callback_data="browse_markets_all")],
+        [InlineKeyboardButton("🔥 Boosted рынки", callback_data="browse_markets_boost")],
+        [InlineKeyboardButton("🏆 Мульти-события (NegRisk)", callback_data="browse_events")],
+        [InlineKeyboardButton("📊 Мои позиции", callback_data="my_positions")],
+    ])
+    await update.message.reply_text(
+        "📈 *Рынки*\n\n"
+        "🌍 *Обзор* — бинарные рынки по категориям с объёмами\n"
+        "🔥 *Boosted* — рынки с повышенными PP\n"
+        "🏆 *Мульти-события* — события с несколькими исходами (FIFA, NBA и т.д.)\n"
+        "📊 *Мои позиции* — рынки, где есть ваши ордера/позиции",
+        reply_markup=keyboard,
+        parse_mode='Markdown'
+    )
+
+
+# =============================================================================
+# ОБЗОР РЫНКОВ (Browse Markets) - категории + объёмы
+# =============================================================================
+
+BROWSE_CATEGORY_NAMES = {
+    'sports': '🏆 Спорт',
+    'politics': '🏛️ Политика',
+    'crypto': '💰 Крипто',
+    'entertainment': '🎬 Развлечения',
+    'science': '🔬 Наука',
+    'economy': '📈 Экономика',
+    'news': '📰 Новости',
+    'culture': '🎭 Культура',
+    '': '📋 Другое'
+}
+
+BROWSE_CATEGORY_ORDER = ['crypto', 'politics', 'economy', 'sports', 'entertainment', 'science', 'news', 'culture', '']
+
+
+def _classify_category(slug: str) -> str:
+    """Определить ключ категории по category_slug рынка."""
+    cat = slug.lower() if slug else ''
+    if 'sport' in cat:
+        return 'sports'
+    if 'politic' in cat:
+        return 'politics'
+    if 'crypto' in cat or 'bitcoin' in cat:
+        return 'crypto'
+    if 'entertain' in cat or 'movie' in cat or 'music' in cat:
+        return 'entertainment'
+    if 'science' in cat or 'tech' in cat:
+        return 'science'
+    if 'econom' in cat or 'finance' in cat:
+        return 'economy'
+    if 'news' in cat:
+        return 'news'
+    if 'culture' in cat or 'art' in cat:
+        return 'culture'
+    return ''
+
+
+def _format_volume(vol: float) -> str:
+    """Форматировать объём в человекочитаемый вид."""
+    if vol >= 1_000_000:
+        return f"${vol / 1_000_000:.1f}M"
+    elif vol >= 1_000:
+        return f"${vol / 1_000:.0f}K"
+    else:
+        return f"${vol:.0f}"
+
+
+@authorized_user_callback
+async def callback_browse_markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запуск обзора рынков (все / boosted)"""
+    query = update.callback_query
+    await query.answer()
+
+    boosted_only = query.data == "browse_markets_boost"
+    await _load_browse_markets(query, context, boosted_only=boosted_only)
+
+
+async def _load_browse_markets(query, context, boosted_only: bool):
+    """Загрузить рынки для обзора с категориями и объёмами."""
+    label = "🔥 Boosted" if boosted_only else "🌍 Все"
+    await query.edit_message_text(f"⏳ Загрузка {label} рынков...")
+
+    try:
+        from predict_api import PredictAPI
+        api = PredictAPI()
+
+        if boosted_only:
+            markets = await asyncio.to_thread(api.get_boosted_markets_for_split, 50)
+        else:
+            markets = await asyncio.to_thread(api.get_markets_for_split, 100)
+
+        if not markets:
+            toggle = "browse_markets_all" if boosted_only else "browse_markets_boost"
+            toggle_text = "📋 Все рынки" if boosted_only else "🔥 Boosted рынки"
+            keyboard = [
+                [InlineKeyboardButton(toggle_text, callback_data=toggle)],
+                [InlineKeyboardButton("« Назад", callback_data="cmd_markets_menu")],
+            ]
+            await query.edit_message_text(
+                "📭 Нет подходящих рынков",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+
+        # Загружаем объёмы
+        await query.edit_message_text(f"⏳ Загрузка объёмов ({len(markets)} рынков)...")
+
+        def _get_volumes(api_inst, ids):
+            vols = {}
+            for mid in ids:
+                try:
+                    stats = api_inst.get_market_stats(mid)
+                    vols[mid] = stats.get('volume_total', 0)
+                except Exception:
+                    vols[mid] = 0
+            return vols
+
+        market_ids = [m.id for m in markets[:80]]
+        volumes = await asyncio.to_thread(_get_volumes, api, market_ids)
+
+        # Группируем по категориям
+        categories: dict = {}
+        for market in markets:
+            cat_key = _classify_category(market.category_slug)
+            categories.setdefault(cat_key, []).append(market)
+
+        # Сортируем внутри каждой категории по объёму (убывание)
+        for cat_key in categories:
+            categories[cat_key].sort(key=lambda m: volumes.get(m.id, 0), reverse=True)
+
+        # Формируем плоский список с заголовками категорий
+        all_items = []
+        for cat_key in BROWSE_CATEGORY_ORDER:
+            if cat_key in categories:
+                cat_display = BROWSE_CATEGORY_NAMES.get(cat_key, '📋 Другое')
+                all_items.append({'type': 'category', 'name': cat_display, 'count': len(categories[cat_key])})
+                for m in categories[cat_key]:
+                    all_items.append({'type': 'market', 'market': m})
+
+        # Статистика по категориям
+        cat_summary = []
+        for cat_key in BROWSE_CATEGORY_ORDER:
+            if cat_key in categories:
+                name = BROWSE_CATEGORY_NAMES.get(cat_key, 'Другое')
+                cnt = len(categories[cat_key])
+                total_vol = sum(volumes.get(m.id, 0) for m in categories[cat_key])
+                cat_summary.append(f"{name}: {cnt} ({_format_volume(total_vol)})")
+
+        context.user_data['browse_items'] = all_items
+        context.user_data['browse_volumes'] = volumes
+        context.user_data['browse_boosted'] = boosted_only
+        context.user_data['browse_cat_summary'] = cat_summary
+        context.user_data['browse_page'] = 0
+
+        await _show_browse_page(query, context, 0)
+
+    except Exception as e:
+        keyboard = [[InlineKeyboardButton("« Назад", callback_data="cmd_markets_menu")]]
+        await query.edit_message_text(f"❌ Ошибка: {e}", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def _show_browse_page(query, context, page: int):
+    """Показать страницу обзора рынков с категориями и объёмами."""
+    ITEMS_PER_PAGE = 14
+
+    all_items = context.user_data.get('browse_items', [])
+    volumes = context.user_data.get('browse_volumes', {})
+    boosted_only = context.user_data.get('browse_boosted', False)
+    cat_summary = context.user_data.get('browse_cat_summary', [])
+
+    total_markets = sum(1 for it in all_items if it['type'] == 'market')
+    total_pages = max(1, (len(all_items) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    context.user_data['browse_page'] = page
+
+    start = page * ITEMS_PER_PAGE
+    end = start + ITEMS_PER_PAGE
+    page_items = all_items[start:end]
+
+    keyboard = []
+    for item in page_items:
+        if item['type'] == 'category':
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"━━ {item['name']} ({item['count']}) ━━",
+                    callback_data="ignore"
+                )
+            ])
+        else:
+            market = item['market']
+            display = market.question if market.question and market.question != market.title else market.title
+            display = display[:35] if display else f"Market {market.id}"
+            vol = _format_volume(volumes.get(market.id, 0))
+            badge = "🔥" if market.is_boosted else ""
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{badge}{display} 📊{vol}",
+                    callback_data=f"browse_detail_{market.id}"
+                )
+            ])
+
+    # Навигация
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("« Назад", callback_data=f"browse_page_{page - 1}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="ignore"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Вперёд »", callback_data=f"browse_page_{page + 1}"))
+    if nav:
+        keyboard.append(nav)
+
+    # Переключатель boost / all
+    if boosted_only:
+        keyboard.append([InlineKeyboardButton("📋 Показать все рынки", callback_data="browse_markets_all")])
+    else:
+        keyboard.append([InlineKeyboardButton("🔥 Только Boosted", callback_data="browse_markets_boost")])
+    keyboard.append([InlineKeyboardButton("« Меню рынков", callback_data="cmd_markets_menu")])
+
+    label = "🔥 Boosted" if boosted_only else "🌍 Все"
+    # Краткая сводка категорий на первой странице
+    summary_text = ""
+    if page == 0 and cat_summary:
+        summary_text = "\n".join(cat_summary) + "\n\n"
+
+    await query.edit_message_text(
+        f"📈 *Обзор рынков ({label})*\n\n"
+        f"{summary_text}"
+        f"📊 Всего: {total_markets} рынков | Стр. {page + 1}/{total_pages}\n"
+        f"_Категории отсортированы по объёму ↓_",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+
+@authorized_user_callback
+async def callback_browse_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переключение страницы обзора рынков."""
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.split('_')[-1])
+    await _show_browse_page(query, context, page)
+
+
+@authorized_user_callback
+async def callback_browse_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать детали рынка из обзора (объём, спред, boost, кнопка SPLIT)."""
+    query = update.callback_query
+    await query.answer()
+
+    market_id = int(query.data.replace("browse_detail_", ""))
     
-    if not accounts:
-        await update.message.reply_text("📭 Нет аккаунтов")
+    # Ищем рынок в browse_items (бинарные)
+    browse_items = context.user_data.get('browse_items', [])
+    market = None
+    vol = 0
+    for item in browse_items:
+        if item['type'] == 'market' and item['market'].id == market_id:
+            market = item['market']
+            volumes = context.user_data.get('browse_volumes', {})
+            vol = volumes.get(market_id, 0)
+            break
+
+    # Ищем в event_sub_markets (NegRisk)
+    if not market:
+        sub_markets = context.user_data.get('event_sub_markets', [])
+        sub_volumes = context.user_data.get('event_sub_volumes', {})
+        for m in sub_markets:
+            if m.get('id') == market_id:
+                # Создаём мини-объект для отображения
+                market = type('M', (), {
+                    'id': m.get('id', 0),
+                    'title': m.get('title', ''),
+                    'question': m.get('question', ''),
+                    'category_slug': m.get('categorySlug', ''),
+                    'is_boosted': m.get('isBoosted', False),
+                    'is_neg_risk': m.get('isNegRisk', True),
+                })()
+                vol = sub_volumes.get(market_id, 0)
+                break
+
+    if not market:
+        keyboard = [[InlineKeyboardButton("« Назад", callback_data=f"browse_page_{context.user_data.get('browse_page', 0)}")]]
+        await query.edit_message_text("❌ Рынок не найден", reply_markup=InlineKeyboardMarkup(keyboard))
         return
+
+    # Загружаем ордербук для отображения спреда
+    try:
+        from predict_api import PredictAPI
+        api = PredictAPI()
+        ob = await asyncio.to_thread(api.get_orderbook, market_id)
+        spread = ob.spread
+        best_bid = ob.best_bid
+        best_ask = ob.best_ask
+        midpoint = ((best_bid or 0) + (best_ask or 0)) / 2 if best_bid and best_ask else None
+    except Exception:
+        spread = None
+        best_bid = None
+        best_ask = None
+        midpoint = None
+
+    # Формируем текст
+    display_name = getattr(market, 'question', '') or ''
+    if not display_name or display_name == getattr(market, 'title', ''):
+        display_name = getattr(market, 'title', f'Market {market_id}')
+    cat_key = _classify_category(getattr(market, 'category_slug', ''))
+    cat_name = BROWSE_CATEGORY_NAMES.get(cat_key, '📋 Другое')
+
+    lines = [
+        f"📌 *{md(display_name)}*",
+        f"",
+        f"🆔 ID: `{market_id}`",
+        f"📂 Категория: {cat_name}",
+        f"📊 Объём: *{_format_volume(vol)}*",
+    ]
+    if getattr(market, 'is_boosted', False):
+        lines.append("🔥 *PP BOOST активен!*")
+    if getattr(market, 'is_neg_risk', False):
+        lines.append("🏆 NegRisk мульти-исходный рынок")
+    if best_bid is not None and best_ask is not None:
+        lines.append(f"")
+        lines.append(f"💹 Best BID: {best_bid * 100:.1f}¢")
+        lines.append(f"💹 Best ASK: {best_ask * 100:.1f}¢")
+        if spread is not None:
+            lines.append(f"📏 Спред: {spread * 100:.1f}¢")
+        if midpoint is not None:
+            lines.append(f"🎯 Midpoint: {midpoint * 100:.1f}¢")
+
+    lines.append("")
+    lines.append("_Нажмите SPLIT чтобы внести ликвидность_")
+
+    # Кнопка SPLIT ведёт к выбору аккаунта
+    back_data = f"browse_page_{context.user_data.get('browse_page', 0)}"
+    if context.user_data.get('event_slug'):
+        back_data = f"event_sub_page_{context.user_data.get('event_sub_page', 0)}"
     
-    msg = await update.message.reply_text("⏳ Загрузка рынков...")
-    
+    keyboard = [
+        [InlineKeyboardButton(f"⚡ SPLIT #{market_id}", callback_data=f"browse_split_acc_{market_id}")],
+        [InlineKeyboardButton("« Назад", callback_data=back_data)],
+        [InlineKeyboardButton("« Меню рынков", callback_data="cmd_markets_menu")],
+    ]
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+
+@authorized_user_callback
+async def callback_browse_split_acc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор аккаунта для SPLIT из обзора рынков."""
+    query = update.callback_query
+    await query.answer()
+
+    market_id = int(query.data.replace("browse_split_acc_", ""))
+    user_id = str(query.from_user.id)
+    accounts = get_accounts_for_user(user_id)
+
+    if not accounts:
+        await query.edit_message_text("📭 Добавьте аккаунт через /accounts")
+        return
+
+    # Если один аккаунт — сразу переходим к выбору суммы
+    if len(accounts) == 1:
+        context.user_data['split_account_idx'] = 0
+        context.user_data['split_market_id'] = market_id
+        keyboard = [
+            [
+                InlineKeyboardButton("$5", callback_data="split_amount_5"),
+                InlineKeyboardButton("$10", callback_data="split_amount_10"),
+                InlineKeyboardButton("$25", callback_data="split_amount_25"),
+            ],
+            [
+                InlineKeyboardButton("$50", callback_data="split_amount_50"),
+                InlineKeyboardButton("$100", callback_data="split_amount_100"),
+            ],
+            [InlineKeyboardButton("✏️ Своя сумма", callback_data="split_custom_amount")],
+            [InlineKeyboardButton("« Назад", callback_data=f"browse_detail_{market_id}")],
+        ]
+        await query.edit_message_text(
+            f"⚡ *SPLIT — Рынок #{market_id}*\n"
+            f"👤 Аккаунт: {accounts[0].name}\n\n"
+            f"Выберите сумму:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        return
+
+    # Несколько аккаунтов — показываем выбор
+    keyboard = []
+    for i, acc in enumerate(accounts):
+        addr_short = f"{acc.predict_account_address[:6]}...{acc.predict_account_address[-4:]}"
+        keyboard.append([
+            InlineKeyboardButton(
+                f"👤 {acc.name} ({addr_short})",
+                callback_data=f"browse_split_pick_{i}_{market_id}"
+            )
+        ])
+    keyboard.append([InlineKeyboardButton("« Назад", callback_data=f"browse_detail_{market_id}")])
+
+    await query.edit_message_text(
+        f"⚡ *SPLIT — Рынок #{market_id}*\n\n"
+        f"Выберите аккаунт:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+
+@authorized_user_callback
+async def callback_browse_split_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Аккаунт выбран из обзора — переходим к выбору суммы."""
+    query = update.callback_query
+    await query.answer()
+
+    # Формат: browse_split_pick_{acc_idx}_{market_id}
+    parts = query.data.replace("browse_split_pick_", "").split("_", 1)
+    acc_idx = int(parts[0])
+    market_id = int(parts[1])
+
+    user_id = str(query.from_user.id)
+    accounts = get_accounts_for_user(user_id)
+
+    if acc_idx >= len(accounts):
+        await query.edit_message_text("❌ Аккаунт не найден")
+        return
+
+    context.user_data['split_account_idx'] = acc_idx
+    context.user_data['split_market_id'] = market_id
+
+    acc = accounts[acc_idx]
+    keyboard = [
+        [
+            InlineKeyboardButton("$5", callback_data="split_amount_5"),
+            InlineKeyboardButton("$10", callback_data="split_amount_10"),
+            InlineKeyboardButton("$25", callback_data="split_amount_25"),
+        ],
+        [
+            InlineKeyboardButton("$50", callback_data="split_amount_50"),
+            InlineKeyboardButton("$100", callback_data="split_amount_100"),
+        ],
+        [InlineKeyboardButton("✏️ Своя сумма", callback_data="split_custom_amount")],
+        [InlineKeyboardButton("« Назад", callback_data=f"browse_split_acc_{market_id}")],
+    ]
+
+    await query.edit_message_text(
+        f"⚡ *SPLIT — Рынок #{market_id}*\n"
+        f"👤 Аккаунт: {acc.name}\n\n"
+        f"Выберите сумму:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+
+@authorized_user_callback
+async def callback_cmd_markets_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вернуться в меню рынков."""
+    query = update.callback_query
+    await query.answer()
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌍 Обзор рынков", callback_data="browse_markets_all")],
+        [InlineKeyboardButton("🔥 Boosted рынки", callback_data="browse_markets_boost")],
+        [InlineKeyboardButton("🏆 Мульти-события (NegRisk)", callback_data="browse_events")],
+        [InlineKeyboardButton("📊 Мои позиции", callback_data="my_positions")],
+    ])
+    await query.edit_message_text(
+        "📈 *Рынки*\n\n"
+        "🌍 *Обзор* — бинарные рынки по категориям с объёмами\n"
+        "🔥 *Boosted* — рынки с повышенными PP\n"
+        "🏆 *Мульти-события* — события с несколькими исходами (FIFA, NBA и т.д.)\n"
+        "📊 *Мои позиции* — рынки, где есть ваши ордера/позиции",
+        reply_markup=keyboard,
+        parse_mode='Markdown'
+    )
+
+
+@authorized_user_callback
+async def callback_my_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать мои позиции (старая логика cmd_markets)."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = str(query.from_user.id)
+    accounts = get_accounts_for_user(user_id)
+
+    if not accounts:
+        keyboard = [[InlineKeyboardButton("« Меню рынков", callback_data="cmd_markets_menu")]]
+        await query.edit_message_text("📭 Нет аккаунтов", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    await query.edit_message_text("⏳ Загрузка позиций...")
+
     total_markets = 0
     text = ""
-    
+
     for acc in accounts:
         try:
             trader = get_or_create_trader(acc)
             if not trader:
                 text += f"👤 *{acc.name}* - ❌ Ошибка создания трейдера\n\n"
                 continue
-            
+
             if not await asyncio.to_thread(trader.init_sdk):
                 text += f"👤 *{acc.name}* - ❌ Ошибка SDK\n\n"
                 continue
-            
+
             if not await asyncio.to_thread(trader.authenticate):
                 text += f"👤 *{acc.name}* - ❌ Ошибка аутентификации\n\n"
                 continue
-            
-            # Загружаем рынки
+
             await asyncio.to_thread(trader.load_all_markets)
-            
+
             if not trader.markets:
                 text += f"👤 *{acc.name}* - 📭 Нет рынков\n\n"
                 continue
-            
-            # Получаем открытые ордера
+
             all_orders = await asyncio.to_thread(trader.api.get_open_orders)
-            
-            # Группируем ордера по market_id
+
             orders_by_market = {}
             for order in all_orders:
                 if order.market_id not in orders_by_market:
                     orders_by_market[order.market_id] = {'yes': [], 'no': []}
-                
-                # Определяем YES/NO по token_id (on_chain_id из outcomes)
                 if state := trader.markets.get(order.market_id):
                     if state.market and state.market.outcomes:
                         yes_token = None
@@ -1995,34 +3275,31 @@ async def cmd_markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 yes_token = outcome.on_chain_id
                             elif outcome.is_no:
                                 no_token = outcome.on_chain_id
-                        
                         if order.token_id == yes_token:
                             orders_by_market[order.market_id]['yes'].append(order)
                         elif order.token_id == no_token:
                             orders_by_market[order.market_id]['no'].append(order)
-            
+
             acc_market_count = len(trader.markets)
             total_markets += acc_market_count
             text += f"👤 *{acc.name}* ({acc_market_count} рынков)\n\n"
-            
+
             for market_id, state in trader.markets.items():
                 title = state.market.title[:35] if state.market else f"#{market_id}"
                 phase = state.split_phase
                 phase_emoji = "⚪" if phase == 0 else "🟡" if phase == 1 else "🟢"
-                
+
                 text += f"{phase_emoji} *{title}*\n"
                 text += f"   YES: {state.yes_position:.1f} | NO: {state.no_position:.1f}\n"
-                
-                # Показываем ордера если есть
+
                 market_orders = orders_by_market.get(market_id, {'yes': [], 'no': []})
                 yes_orders = market_orders['yes']
                 no_orders = market_orders['no']
-                
+
                 if yes_orders or no_orders:
                     orders_text = "   📋 Ордера: "
                     parts = []
                     for o in yes_orders:
-                        # maker_amount в wei (1e18)
                         qty = wei_to_float(o.maker_amount)
                         value = qty * o.price_per_share
                         parts.append(f"YES {qty:.1f}шт (${value:.1f})")
@@ -2031,27 +3308,253 @@ async def cmd_markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         value = qty * o.price_per_share
                         parts.append(f"NO {qty:.1f}шт (${value:.1f})")
                     text += orders_text + ", ".join(parts) + "\n"
-            
+
             text += "\n"
-            
+
         except Exception as e:
             text += f"👤 *{acc.name}* - ❌ Ошибка: {e}\n\n"
-    
-    header = f"📊 *Активные рынки ({total_markets})*\n\n"
+
+    header = f"📊 *Мои позиции ({total_markets} рынков)*\n\n"
     text = header + text
     text += "_Фазы: ⚪0=нет токенов, 🟡1=есть токены, 🟢2=ордера выставлены_"
-    
-    # Telegram лимит 4096 символов
+
     if len(text) > 4000:
         text = text[:3990] + "..._"
-    
-    await msg.edit_text(text, parse_mode='Markdown')
+
+    keyboard = [[InlineKeyboardButton("« Меню рынков", callback_data="cmd_markets_menu")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 
-@admin_only
+# =============================================================================
+# МУЛЬТИ-СОБЫТИЯ (NegRisk Events) - FIFA, NBA, EPL и т.д.
+# =============================================================================
+
+@authorized_user_callback
+async def callback_browse_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать список NegRisk мульти-исходных событий."""
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text("⏳ Загрузка мульти-событий...")
+
+    try:
+        from predict_api import PredictAPI
+        api = PredictAPI()
+        events = await asyncio.to_thread(api.get_neg_risk_events)
+
+        if not events:
+            keyboard = [[InlineKeyboardButton("« Меню рынков", callback_data="cmd_markets_menu")]]
+            await query.edit_message_text("📭 Нет доступных мульти-событий", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+
+        # Сортируем по количеству рынков (больше рынков = интереснее)
+        events.sort(key=lambda e: len(e.get('markets', [])), reverse=True)
+
+        context.user_data['neg_risk_events'] = events
+        context.user_data['events_page'] = 0
+
+        await _show_events_page(query, context, 0)
+
+    except Exception as e:
+        keyboard = [[InlineKeyboardButton("« Меню рынков", callback_data="cmd_markets_menu")]]
+        await query.edit_message_text(f"❌ Ошибка: {e}", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def _show_events_page(query, context, page: int):
+    """Показать страницу списка NegRisk событий."""
+    EVENTS_PER_PAGE = 8
+
+    events = context.user_data.get('neg_risk_events', [])
+    total_pages = max(1, (len(events) + EVENTS_PER_PAGE - 1) // EVENTS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    context.user_data['events_page'] = page
+
+    start = page * EVENTS_PER_PAGE
+    end = start + EVENTS_PER_PAGE
+    page_events = events[start:end]
+
+    keyboard = []
+    for ev in page_events:
+        title = ev.get('title', ev.get('slug', 'Unknown'))[:40]
+        markets_count = len(ev.get('markets', []))
+        slug = ev.get('slug', '')
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🏆 {title} ({markets_count})",
+                callback_data=f"event_{slug[:50]}"
+            )
+        ])
+
+    # Навигация
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("« Назад", callback_data=f"events_page_{page - 1}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="ignore"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Вперёд »", callback_data=f"events_page_{page + 1}"))
+    if nav:
+        keyboard.append(nav)
+
+    keyboard.append([InlineKeyboardButton("« Меню рынков", callback_data="cmd_markets_menu")])
+
+    await query.edit_message_text(
+        f"🏆 *Мульти-события (NegRisk)*\n\n"
+        f"Всего: {len(events)} событий | Стр. {page + 1}/{total_pages}\n"
+        f"_Нажмите на событие чтобы увидеть исходы_",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+
+@authorized_user_callback
+async def callback_events_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переключение страницы событий."""
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.split('_')[-1])
+    await _show_events_page(query, context, page)
+
+
+@authorized_user_callback
+async def callback_event_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать суб-рынки (исходы) конкретного события."""
+    query = update.callback_query
+    await query.answer()
+
+    slug = query.data.replace("event_", "", 1)
+
+    # Ищем событие в сохранённом списке
+    events = context.user_data.get('neg_risk_events', [])
+    event = None
+    for ev in events:
+        if ev.get('slug', '')[:50] == slug:
+            event = ev
+            break
+
+    if not event:
+        keyboard = [[InlineKeyboardButton("« К событиям", callback_data="browse_events")]]
+        await query.edit_message_text("❌ Событие не найдено", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    await query.edit_message_text("⏳ Загрузка исходов...")
+
+    try:
+        from predict_api import PredictAPI
+        api = PredictAPI()
+
+        # Загружаем полную категорию с рынками
+        full_event = await asyncio.to_thread(api.get_category_by_slug, event.get('slug', ''))
+        if not full_event:
+            full_event = event
+
+        sub_markets = full_event.get('markets', [])
+        if not sub_markets:
+            keyboard = [[InlineKeyboardButton("« К событиям", callback_data="browse_events")]]
+            await query.edit_message_text("📭 Нет исходов в этом событии", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+
+        # Фильтруем только торгуемые рынки (tradingStatus=OPEN)
+        sub_markets = [m for m in sub_markets if m.get('tradingStatus') == 'OPEN']
+
+        # Сортируем по questionIndex
+        sub_markets.sort(key=lambda m: m.get('questionIndex', 0) or 0)
+
+        # Загружаем объёмы для суб-рынков
+        def _get_sub_volumes(api_inst, markets):
+            vols = {}
+            for m in markets:
+                mid = m.get('id', 0)
+                try:
+                    stats = api_inst.get_market_stats(mid)
+                    vols[mid] = stats.get('volume_total', 0)
+                except Exception:
+                    vols[mid] = 0
+            return vols
+
+        volumes = await asyncio.to_thread(_get_sub_volumes, api, sub_markets)
+
+        context.user_data['event_sub_markets'] = sub_markets
+        context.user_data['event_sub_volumes'] = volumes
+        context.user_data['event_slug'] = event.get('slug', '')
+        context.user_data['event_title'] = event.get('title', slug)
+        context.user_data['event_sub_page'] = 0
+
+        await _show_event_sub_page(query, context, 0)
+
+    except Exception as e:
+        keyboard = [[InlineKeyboardButton("« К событиям", callback_data="browse_events")]]
+        await query.edit_message_text(f"❌ Ошибка: {e}", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def _show_event_sub_page(query, context, page: int):
+    """Показать страницу суб-рынков (исходов) внутри события."""
+    ITEMS_PER_PAGE = 10
+
+    sub_markets = context.user_data.get('event_sub_markets', [])
+    volumes = context.user_data.get('event_sub_volumes', {})
+    event_title = context.user_data.get('event_title', 'Событие')
+
+    total_pages = max(1, (len(sub_markets) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    context.user_data['event_sub_page'] = page
+
+    start = page * ITEMS_PER_PAGE
+    end = start + ITEMS_PER_PAGE
+    page_items = sub_markets[start:end]
+
+    # Общий объём события
+    total_vol = sum(volumes.values())
+
+    keyboard = []
+    for m in page_items:
+        mid = m.get('id', 0)
+        title = m.get('title', f'#{mid}')[:35]
+        vol = _format_volume(volumes.get(mid, 0))
+        boosted = "🔥" if m.get('isBoosted', False) else ""
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{boosted}{title} 📊{vol}",
+                callback_data=f"browse_detail_{mid}"
+            )
+        ])
+
+    # Навигация
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("« Назад", callback_data=f"event_sub_page_{page - 1}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="ignore"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Вперёд »", callback_data=f"event_sub_page_{page + 1}"))
+    if nav:
+        keyboard.append(nav)
+
+    keyboard.append([InlineKeyboardButton("« К событиям", callback_data="browse_events")])
+    keyboard.append([InlineKeyboardButton("« Меню рынков", callback_data="cmd_markets_menu")])
+
+    await query.edit_message_text(
+        f"🏆 *{md(event_title)}*\n\n"
+        f"📊 Общий объём: *{_format_volume(total_vol)}*\n"
+        f"📋 Исходов: {len(sub_markets)} | Стр. {page + 1}/{total_pages}\n"
+        f"_Нажмите на исход для деталей и SPLIT_",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+
+@authorized_user_callback
+async def callback_event_sub_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переключение страницы суб-рынков события."""
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.split('_')[-1])
+    await _show_event_sub_page(query, context, page)
+
+
+@authorized_user
 async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /refresh - принудительное обновление списка рынков"""
-    accounts = load_accounts()
+    user_id = str(update.effective_user.id)
+    accounts = get_accounts_for_user(user_id)
     
     if not accounts:
         await update.message.reply_text("📭 Нет аккаунтов")
@@ -2108,10 +3611,11 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(text, parse_mode='Markdown')
 
 
-@admin_only
+@authorized_user
 async def cmd_split(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /split - запустить SPLIT"""
-    accounts = load_accounts()
+    user_id = str(update.effective_user.id)
+    accounts = get_accounts_for_user(user_id)
     
     if not accounts:
         await update.message.reply_text("📭 Добавьте аккаунт через /accounts")
@@ -2132,14 +3636,15 @@ async def cmd_split(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_split_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор аккаунта для SPLIT - загружаем ВСЕ подходящие рынки"""
+    """Выбор аккаунта для SPLIT - показываем выбор типа маркетов"""
     query = update.callback_query
     await query.answer()
     
+    user_id = str(update.effective_user.id)
     acc_idx = int(query.data.split('_')[-1])
-    accounts = load_accounts()
+    accounts = get_accounts_for_user(user_id)
     
     if acc_idx >= len(accounts):
         await query.edit_message_text("❌ Аккаунт не найден")
@@ -2148,22 +3653,64 @@ async def callback_split_account(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data['split_account_idx'] = acc_idx
     acc = accounts[acc_idx]
     
-    await query.edit_message_text("⏳ Загрузка рынков для SPLIT...", parse_mode='Markdown')
+    # Показываем выбор типа маркетов: Boost или Все
+    keyboard = [
+        [InlineKeyboardButton("🔥 Boost маркеты (больше PP)", callback_data="split_type_boost")],
+        [InlineKeyboardButton("📋 Все маркеты", callback_data="split_type_all")],
+        [InlineKeyboardButton("« Назад", callback_data="menu_split")],
+    ]
+    
+    await query.edit_message_text(
+        f"⚡ *SPLIT - {acc.name}*\n\n"
+        f"Выберите тип маркетов:\n\n"
+        f"🔥 *Boost* — маркеты с повышенным начислением PP\n"
+        f"📋 *Все* — все подходящие маркеты для SPLIT",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+    
+    return ConversationHandler.END
+
+
+async def _load_split_markets(query, context, boosted_only: bool):
+    """Загрузить маркеты для SPLIT (общая логика для boost и all)"""
+    acc_idx = context.user_data.get('split_account_idx', 0)
+    accounts = load_accounts()
+    
+    if acc_idx >= len(accounts):
+        await query.edit_message_text("❌ Аккаунт не найден")
+        return
+    
+    acc = accounts[acc_idx]
+    market_type_label = "🔥 Boost" if boosted_only else "📋 Все"
+    
+    await query.edit_message_text(
+        f"⏳ Загрузка {market_type_label} рынков для SPLIT...", 
+        parse_mode='Markdown'
+    )
     
     try:
         from predict_api import PredictAPI
         api = PredictAPI()
         
-        # Получаем все рынки подходящие для SPLIT
-        markets = await asyncio.to_thread(api.get_markets_for_split, 100)
+        # Получаем рынки в зависимости от типа
+        if boosted_only:
+            markets = await asyncio.to_thread(api.get_boosted_markets_for_split, 50)
+        else:
+            markets = await asyncio.to_thread(api.get_markets_for_split, 100)
         
         if not markets:
-            keyboard = [[InlineKeyboardButton("« Главное меню", callback_data="main_menu")]]
-            await query.edit_message_text("📭 Нет подходящих рынков", reply_markup=InlineKeyboardMarkup(keyboard))
-            return ConversationHandler.END
+            keyboard = [
+                [InlineKeyboardButton("🔥 Boost маркеты", callback_data="split_type_boost")] if not boosted_only else [InlineKeyboardButton("📋 Все маркеты", callback_data="split_type_all")],
+                [InlineKeyboardButton("« Главное меню", callback_data="main_menu")]
+            ]
+            no_market_text = "📭 Нет boosted маркетов с 2 исходами" if boosted_only else "📭 Нет подходящих рынков"
+            await query.edit_message_text(no_market_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            return
         
         # Сохраняем рынки
         context.user_data['split_markets'] = {m.id: m for m in markets}
+        context.user_data['split_boosted_only'] = boosted_only
         
         # Загружаем объемы (параллельно для скорости)
         await query.edit_message_text("⏳ Загрузка объемов...", parse_mode='Markdown')
@@ -2243,12 +3790,24 @@ async def callback_split_account(update: Update, context: ContextTypes.DEFAULT_T
         # Показываем первую страницу
         await show_split_markets_page(query, context, 0)
         
-        return ConversationHandler.END
+        return
         
     except Exception as e:
         keyboard = [[InlineKeyboardButton("« Главное меню", callback_data="main_menu")]]
         await query.edit_message_text(f"❌ Ошибка: {e}", reply_markup=InlineKeyboardMarkup(keyboard))
-        return ConversationHandler.END
+        return
+
+
+@authorized_user_callback
+async def callback_split_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор типа маркетов для SPLIT: Boost или Все"""
+    query = update.callback_query
+    await query.answer()
+    
+    split_type = query.data.replace("split_type_", "")
+    boosted_only = (split_type == "boost")
+    
+    await _load_split_markets(query, context, boosted_only=boosted_only)
 
 
 async def show_split_markets_page(query, context, page: int):
@@ -2258,8 +3817,10 @@ async def show_split_markets_page(query, context, page: int):
     all_items = context.user_data.get('split_all_items', [])
     volumes = context.user_data.get('split_volumes', {})
     acc_idx = context.user_data.get('split_account_idx', 0)
+    boosted_only = context.user_data.get('split_boosted_only', False)
     
-    accounts = load_accounts()
+    user_id = str(query.from_user.id)
+    accounts = get_accounts_for_user(user_id)
     acc = accounts[acc_idx] if acc_idx < len(accounts) else None
     acc_name = acc.name if acc else "Unknown"
     
@@ -2297,10 +3858,14 @@ async def show_split_markets_page(query, context, page: int):
             current_category = item['name']
         else:
             market = item['market']
-            title = market.title[:23] if market.title else f"Market {market.id}"
+            # question содержит полное описание события (например, "LoL: Gen.G vs BNK FEARX (BO5)")
+            # title часто просто "Match Winner" — неинформативно
+            display_name = market.question if market.question and market.question != market.title else market.title
+            display_name = display_name[:35] if display_name else f"Market {market.id}"
             vol = format_volume(volumes.get(market.id, 0))
+            boost_badge = "🔥 " if market.is_boosted else ""
             keyboard.append([
-                InlineKeyboardButton(f"#{market.id}: {title}.. [{vol}]", callback_data=f"split_market_{market.id}")
+                InlineKeyboardButton(f"{boost_badge}{display_name} [{vol}]", callback_data=f"split_market_{market.id}")
             ])
     
     # Кнопки навигации
@@ -2315,10 +3880,19 @@ async def show_split_markets_page(query, context, page: int):
         keyboard.append(nav_buttons)
     
     keyboard.append([InlineKeyboardButton("✏️ Ввести ID вручную", callback_data="split_manual")])
+    
+    # Кнопка переключения типа маркетов
+    if boosted_only:
+        keyboard.append([InlineKeyboardButton("📋 Показать все маркеты", callback_data="split_type_all")])
+    else:
+        keyboard.append([InlineKeyboardButton("🔥 Показать Boost маркеты", callback_data="split_type_boost")])
+    
     keyboard.append([InlineKeyboardButton("« Главное меню", callback_data="main_menu")])
     
+    type_label = "🔥 Boost" if boosted_only else "📋 Все"
+    
     await query.edit_message_text(
-        f"⚡ *SPLIT - {acc_name}*\n\n"
+        f"⚡ *SPLIT - {acc_name}* ({type_label})\n\n"
         f"📊 Всего рынков: {total_markets}\n"
         f"📄 Страница {page+1} из {total_pages}\n\n"
         f"_Сгруппировано по категориям, отсортировано по объёму_",
@@ -2327,7 +3901,7 @@ async def show_split_markets_page(query, context, page: int):
     )
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_split_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Переключение страницы рынков в SPLIT"""
     query = update.callback_query
@@ -2337,7 +3911,7 @@ async def callback_split_page(update: Update, context: ContextTypes.DEFAULT_TYPE
     await show_split_markets_page(query, context, page)
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_market_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать детальную информацию о рынке"""
     query = update.callback_query
@@ -2347,7 +3921,7 @@ async def callback_market_info(update: Update, context: ContextTypes.DEFAULT_TYP
     await show_market_details(query, context, market_id)
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_markets_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выбор аккаунта для просмотра рынков"""
     query = update.callback_query
@@ -2364,7 +3938,7 @@ async def callback_markets_account(update: Update, context: ContextTypes.DEFAULT
     await show_markets_for_account(query, context, acc)
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_split_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выбор рынка для SPLIT"""
     query = update.callback_query
@@ -2396,17 +3970,18 @@ async def callback_split_market(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_split_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выполнение SPLIT с выбранной суммой"""
     query = update.callback_query
     await query.answer()
     
+    user_id = str(update.effective_user.id)
     amount = float(query.data.split('_')[-1])
     market_id = context.user_data.get('split_market_id')
     acc_idx = context.user_data.get('split_account_idx', 0)
     
-    accounts = load_accounts()
+    accounts = get_accounts_for_user(user_id)
     if acc_idx >= len(accounts):
         await query.edit_message_text("❌ Аккаунт не найден")
         return
@@ -2498,7 +4073,7 @@ async def callback_split_amount(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data.clear()
 
 
-@admin_only_callback  
+@authorized_user_callback  
 async def callback_split_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ручной ввод ID рынка"""
     query = update.callback_query
@@ -2514,7 +4089,7 @@ async def callback_split_manual(update: Update, context: ContextTypes.DEFAULT_TY
     return STATE_WAITING_MARKET_ID
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_split_custom_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ручной ввод суммы"""
     query = update.callback_query
@@ -2565,7 +4140,8 @@ async def handle_split_amount(update: Update, context: ContextTypes.DEFAULT_TYPE
     acc_idx = context.user_data.get('split_account_idx', 0)
     market_id = context.user_data.get('split_market_id')
     
-    accounts = load_accounts()
+    user_id_str = str(update.effective_user.id)
+    accounts = get_accounts_for_user(user_id_str)
     if acc_idx >= len(accounts):
         await update.message.reply_text("❌ Аккаунт не найден")
         return ConversationHandler.END
@@ -2633,10 +4209,11 @@ async def handle_split_amount(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-@admin_only
+@authorized_user
 async def cmd_start_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start_bot - запустить мониторинг"""
-    accounts = load_accounts()
+    user_id = str(update.effective_user.id)
+    accounts = get_accounts_for_user(user_id)
     
     if not accounts:
         await update.message.reply_text("📭 Добавьте аккаунт через /accounts")
@@ -2659,14 +4236,15 @@ async def cmd_start_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_start_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Запуск мониторинга для аккаунта"""
     query = update.callback_query
     await query.answer()
     
+    user_id = str(update.effective_user.id)
     acc_idx = int(query.data.split('_')[-1])
-    accounts = load_accounts()
+    accounts = get_accounts_for_user(user_id)
     
     if acc_idx >= len(accounts):
         await query.edit_message_text("❌ Аккаунт не найден")
@@ -2676,7 +4254,7 @@ async def callback_start_account(update: Update, context: ContextTypes.DEFAULT_T
     
     await query.edit_message_text(f"⏳ Запуск мониторинга для *{acc.name}*...", parse_mode='Markdown')
     
-    success = await start_monitoring(acc, context)
+    success = await start_monitoring(acc, context, owner_id=user_id)
     
     keyboard = [[InlineKeyboardButton("« Главное меню", callback_data="main_menu")]]
     
@@ -2694,19 +4272,20 @@ async def callback_start_account(update: Update, context: ContextTypes.DEFAULT_T
         )
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_start_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Запуск мониторинга для всех"""
     query = update.callback_query
     await query.answer()
     
-    accounts = load_accounts()
+    user_id = str(update.effective_user.id)
+    accounts = get_accounts_for_user(user_id)
     
     await query.edit_message_text("⏳ Запуск всех аккаунтов...")
     
     started = 0
     for acc in accounts:
-        if await start_monitoring(acc, context):
+        if await start_monitoring(acc, context, owner_id=user_id):
             started += 1
     
     keyboard = [[InlineKeyboardButton("« Главное меню", callback_data="main_menu")]]
@@ -2717,10 +4296,11 @@ async def callback_start_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
 
 
-@admin_only
+@authorized_user
 async def cmd_stop_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /stop_bot - остановить мониторинг"""
-    accounts = load_accounts()
+    user_id = str(update.effective_user.id)
+    accounts = get_accounts_for_user(user_id)
     
     running_count = sum(1 for acc in accounts if bot_state.running.get(acc.predict_account_address, False))
     
@@ -2745,14 +4325,15 @@ async def cmd_stop_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_stop_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Остановка мониторинга для аккаунта"""
     query = update.callback_query
     await query.answer()
     
+    user_id = str(update.effective_user.id)
     acc_idx = int(query.data.split('_')[-1])
-    accounts = load_accounts()
+    accounts = get_accounts_for_user(user_id)
     
     if acc_idx >= len(accounts):
         await query.edit_message_text("❌ Аккаунт не найден")
@@ -2769,13 +4350,14 @@ async def callback_stop_account(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-@admin_only_callback
+@authorized_user_callback
 async def callback_stop_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Остановка всех"""
     query = update.callback_query
     await query.answer()
     
-    accounts = load_accounts()
+    user_id = str(update.effective_user.id)
+    accounts = get_accounts_for_user(user_id)
     
     for acc in accounts:
         await stop_monitoring(acc)
@@ -2791,28 +4373,38 @@ async def callback_stop_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # МОНИТОРИНГ
 # =============================================================================
 
-def get_or_create_trader(acc: AccountConfig) -> Optional[PredictTrader]:
+def get_or_create_trader(acc: AccountConfig, owner_id: str = None) -> Optional[PredictTrader]:
     """Получить или создать трейдера для аккаунта"""
     if acc.predict_account_address in bot_state.traders:
-        return bot_state.traders[acc.predict_account_address]
+        trader = bot_state.traders[acc.predict_account_address]
+        effective_owner = owner_id or bot_state.account_owners.get(acc.predict_account_address, TELEGRAM_ADMIN_ID)
+        apply_user_trade_settings_to_trader(trader, effective_owner)
+        return trader
+
+    effective_owner = owner_id or bot_state.account_owners.get(acc.predict_account_address, TELEGRAM_ADMIN_ID)
+    settings = get_user_trade_settings(effective_owner)
     
     trader = PredictTrader(
         market_ids=None,
         monitor_mode=True,
-        account=acc
+        account=acc,
+        ask_position_offset=settings['ask_position_offset'],
+        reposition_delay=settings['reposition_delay'],
     )
     
     bot_state.traders[acc.predict_account_address] = trader
     return trader
 
 
-async def start_monitoring(acc: AccountConfig, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def start_monitoring(acc: AccountConfig, context: ContextTypes.DEFAULT_TYPE, owner_id: str = None) -> bool:
     """Запустить мониторинг для аккаунта (с персистентностью)"""
+    owner_id = owner_id or TELEGRAM_ADMIN_ID
     if bot_state.running.get(acc.predict_account_address, False):
         return True  # Уже запущен
     
     try:
-        trader = get_or_create_trader(acc)
+        trader = get_or_create_trader(acc, owner_id=owner_id)
+        apply_user_trade_settings_to_trader(trader, owner_id)
         
         # Запускаем синхронные методы в отдельном потоке
         if not await asyncio.to_thread(trader.init_sdk):
@@ -2833,8 +4425,11 @@ async def start_monitoring(acc: AccountConfig, context: ContextTypes.DEFAULT_TYP
             logger.info(f"🔄 Запуск polling мониторинга для {acc.name}")
         bot_state.tasks[acc.predict_account_address] = task
         
+        # Сохраняем владельца аккаунта
+        bot_state.account_owners[acc.predict_account_address] = owner_id
+        
         # Сохраняем состояние (персистентно!)
-        bot_state.mark_account_running(acc.predict_account_address, acc.name, True)
+        bot_state.mark_account_running(acc.predict_account_address, acc.name, True, owner_id=owner_id)
         
         logger.info(f"✅ Мониторинг запущен для {acc.name}, состояние сохранено")
         return True
@@ -2861,19 +4456,22 @@ async def stop_monitoring(acc: AccountConfig):
     logger.info(f"⏹ Мониторинг остановлен для {acc.name}, состояние сохранено")
 
 
-async def _restore_monitoring(acc: AccountConfig, application: Application) -> bool:
+async def _restore_monitoring(acc: AccountConfig, application: Application, owner_id: str = None) -> bool:
     """
     Восстановить мониторинг для аккаунта при старте бота (без context).
     
     Используется в post_init где нет пользовательского context.
     """
+    owner_id = owner_id or TELEGRAM_ADMIN_ID
     addr = acc.predict_account_address
+    bot_state.account_owners[addr] = owner_id
     
     if bot_state.running.get(addr, False):
         return True  # Уже запущен
     
     try:
-        trader = get_or_create_trader(acc)
+        trader = get_or_create_trader(acc, owner_id=owner_id)
+        apply_user_trade_settings_to_trader(trader, owner_id)
         
         if not await asyncio.to_thread(trader.init_sdk):
             return False
@@ -2904,7 +4502,9 @@ async def monitoring_loop(acc: AccountConfig, trader: PredictTrader, context: Co
     cycle = 0
     consecutive_errors = 0
     addr = acc.predict_account_address
-    ps = bot_state.persistent
+    owner_id = bot_state.account_owners.get(addr, TELEGRAM_ADMIN_ID)
+    owner_chat_id = owner_id
+    ps = bot_state.get_persistent_for_user(owner_id)
     
     # Запоминаем предыдущие позиции для детекции исполнений
     prev_positions: Dict[int, Dict[str, float]] = {}  # market_id -> {yes: x, no: x}
@@ -2919,7 +4519,7 @@ async def monitoring_loop(acc: AccountConfig, trader: PredictTrader, context: Co
                 if trader.markets:
                     resolved = await asyncio.to_thread(trader.check_and_handle_resolved_markets)
                     if resolved:
-                        await send_resolved_market_notification(acc.name, resolved)
+                        await send_resolved_market_notification(acc.name, resolved, chat_id=owner_chat_id)
                         # Обновляем персистентное состояние
                         for res in resolved:
                             ps.update_market(addr, res['market_id'], split_phase=0,
@@ -2970,7 +4570,8 @@ async def monitoring_loop(acc: AccountConfig, trader: PredictTrader, context: Co
                                     f"NO sold: {ms.no_sold:.1f}\n"
                                     f"Разница: {imbalance:.1f} токенов\n\n"
                                     f"Рекомендуется проверить позиции!",
-                                    "FILL IMBALANCE"
+                                    "FILL IMBALANCE",
+                                    chat_id=owner_chat_id
                                 )
                     
                     # Обновляем позиции в персистентном состоянии
@@ -2985,7 +4586,13 @@ async def monitoring_loop(acc: AccountConfig, trader: PredictTrader, context: Co
                 # Отправляем уведомление о переставлении ордеров
                 repositioned = result.get('repositioned', [])
                 if repositioned:
-                    await send_repositioning_notification(acc.name, repositioned)
+                    await send_repositioning_notification(
+                        acc.name,
+                        repositioned,
+                        chat_id=owner_chat_id,
+                        reposition_delay=trader.reposition_delay,
+                        account_address=addr,
+                    )
                 
                 # 🚨 Отправляем ГРОМКОЕ уведомление об исполнениях
                 fills = result.get('fills_detected', [])
@@ -3001,9 +4608,9 @@ async def monitoring_loop(acc: AccountConfig, trader: PredictTrader, context: Co
                     fills_text += f"🕐 {datetime.now().strftime('%H:%M:%S')}"
                     
                     try:
-                        if TELEGRAM_ADMIN_ID and bot_state.app:
+                        if owner_chat_id and bot_state.app:
                             await bot_state.app.bot.send_message(
-                                chat_id=int(TELEGRAM_ADMIN_ID),
+                                chat_id=int(owner_chat_id),
                                 text=fills_text,
                                 parse_mode='Markdown',
                                 disable_notification=False,  # ГРОМКОЕ уведомление!
@@ -3035,7 +4642,8 @@ async def monitoring_loop(acc: AccountConfig, trader: PredictTrader, context: Co
                     f"Цикл: #{cycle}\n"
                     f"Ошибок подряд: {consecutive_errors}\n\n"
                     f"{type(e).__name__}: {e}",
-                    "MONITORING ERROR"
+                    "MONITORING ERROR",
+                    chat_id=owner_chat_id
                 )
             
             await asyncio.sleep(5)
@@ -3057,7 +4665,9 @@ async def monitoring_loop_ws(acc: AccountConfig, trader: PredictTrader, context:
     переставляет их если нужно. Fallback polling каждые WS_FALLBACK_INTERVAL сек.
     """
     addr = acc.predict_account_address
-    ps = bot_state.persistent
+    owner_id = bot_state.account_owners.get(addr, TELEGRAM_ADMIN_ID)
+    owner_chat_id = owner_id
+    ps = bot_state.get_persistent_for_user(owner_id)
     
     # Запоминаем предыдущие позиции для детекции исполнений
     prev_positions: Dict[int, Dict[str, float]] = {}
@@ -3089,13 +4699,43 @@ async def monitoring_loop_ws(acc: AccountConfig, trader: PredictTrader, context:
     
     # --- Обработка события orderbook ---
     
+    async def handle_phase1_market(market_id: int):
+        """Обработать рынок в Phase 1 — выставить SELL ордера"""
+        if market_id not in trader.markets:
+            return False
+        state = trader.markets[market_id]
+        if state.split_phase != 1:
+            return False
+        
+        async with reposition_lock:
+            try:
+                trader._switch_to_market(market_id)
+                result = await asyncio.to_thread(trader.strategy_split)
+                orders_placed = result.get('orders_placed', 0)
+                if orders_placed > 0:
+                    state.split_phase = 2
+                    ps.update_market(addr, market_id, split_phase=2)
+                    logger.info(f"[{acc.name}] ✅ #{market_id}: выставлено {orders_placed} ордеров (Phase 1 → 2)")
+                    return True
+                else:
+                    logger.warning(f"[{acc.name}] ⚠️ #{market_id} Phase 1: {result.get('message', 'ордера не создались')}")
+            except Exception as e:
+                logger.error(f"[{acc.name}] Phase 1 #{market_id}: {e}")
+        return False
+
     async def handle_orderbook_event(market_id: int):
         """Мгновенная реакция на изменение стакана"""
         if market_id not in trader.markets:
             return
         
         state = trader.markets[market_id]
-        if state.split_phase < 2:
+        
+        # Phase 1 — пробуем выставить ордера при каждом обновлении стакана
+        if state.split_phase == 1:
+            await handle_phase1_market(market_id)
+            return
+        
+        if state.split_phase < 1:
             return
         
         async with reposition_lock:
@@ -3125,7 +4765,13 @@ async def monitoring_loop_ws(acc: AccountConfig, trader: PredictTrader, context:
                             'market_id': market_id,
                             **r
                         } for r in repositioned]
-                        await send_repositioning_notification(acc.name, enriched)
+                        await send_repositioning_notification(
+                            acc.name,
+                            enriched,
+                            chat_id=owner_chat_id,
+                            reposition_delay=trader.reposition_delay,
+                            account_address=addr,
+                        )
                 
                 # Проверяем fills
                 fills = result.get('fills_detected', [])
@@ -3141,9 +4787,9 @@ async def monitoring_loop_ws(acc: AccountConfig, trader: PredictTrader, context:
                     fills_text += f"🕐 {datetime.now().strftime('%H:%M:%S')}"
                     
                     try:
-                        if TELEGRAM_ADMIN_ID and bot_state.app:
+                        if owner_chat_id and bot_state.app:
                             await bot_state.app.bot.send_message(
-                                chat_id=int(TELEGRAM_ADMIN_ID),
+                                chat_id=int(owner_chat_id),
                                 text=fills_text,
                                 parse_mode='Markdown',
                                 disable_notification=False,
@@ -3171,7 +4817,8 @@ async def monitoring_loop_ws(acc: AccountConfig, trader: PredictTrader, context:
                                 f"NO sold: {mstate.no_sold:.1f}\n"
                                 f"Разница: {imbalance:.1f} токенов\n\n"
                                 f"Рекомендуется проверить позиции!",
-                                "FILL IMBALANCE"
+                                "FILL IMBALANCE",
+                                chat_id=owner_chat_id
                             )
                 
                 ps.update_market(addr, market_id,
@@ -3207,9 +4854,9 @@ async def monitoring_loop_ws(acc: AccountConfig, trader: PredictTrader, context:
         if event_type == 'orderNotAccepted':
             logger.warning(f"[{acc.name}] ❌ WS: ордер отклонён | {outcome} qty={quantity} @ {price} | {market_question}")
             try:
-                if TELEGRAM_ADMIN_ID and bot_state.app:
+                if owner_chat_id and bot_state.app:
                     await bot_state.app.bot.send_message(
-                        chat_id=int(TELEGRAM_ADMIN_ID),
+                        chat_id=int(owner_chat_id),
                         text=(
                             f"❌ *ОРДЕР ОТКЛОНЁН*\n"
                             f"👤 {acc.name}\n"
@@ -3228,9 +4875,9 @@ async def monitoring_loop_ws(acc: AccountConfig, trader: PredictTrader, context:
         if event_type == 'orderExpired':
             logger.warning(f"[{acc.name}] ⏰ WS: ордер истёк | {outcome} qty={quantity} @ {price} | {market_question}")
             try:
-                if TELEGRAM_ADMIN_ID and bot_state.app:
+                if owner_chat_id and bot_state.app:
                     await bot_state.app.bot.send_message(
-                        chat_id=int(TELEGRAM_ADMIN_ID),
+                        chat_id=int(owner_chat_id),
                         text=(
                             f"⏰ *ОРДЕР ИСТЁК*\n"
                             f"👤 {acc.name}\n"
@@ -3260,9 +4907,9 @@ async def monitoring_loop_ws(acc: AccountConfig, trader: PredictTrader, context:
         if event_type == 'orderTransactionSubmitted':
             logger.warning(f"[{acc.name}] 🚨 ОРДЕР СМАТЧЕН! | {outcome} qty={quantity} @ {price} | {market_question}")
             try:
-                if TELEGRAM_ADMIN_ID and bot_state.app:
+                if owner_chat_id and bot_state.app:
                     await bot_state.app.bot.send_message(
-                        chat_id=int(TELEGRAM_ADMIN_ID),
+                        chat_id=int(owner_chat_id),
                         text=(
                             f"⚡ *ОРДЕР СМАТЧЕН!*\n"
                             f"👤 {acc.name}\n"
@@ -3284,9 +4931,9 @@ async def monitoring_loop_ws(acc: AccountConfig, trader: PredictTrader, context:
         if event_type == 'orderTransactionSuccess':
             logger.info(f"[{acc.name}] ✅ WS: транзакция выполнена | {outcome} qty={quantity} @ {price} | {market_question}")
             try:
-                if TELEGRAM_ADMIN_ID and bot_state.app:
+                if owner_chat_id and bot_state.app:
                     await bot_state.app.bot.send_message(
-                        chat_id=int(TELEGRAM_ADMIN_ID),
+                        chat_id=int(owner_chat_id),
                         text=(
                             f"✅ *ТРАНЗАКЦИЯ ВЫПОЛНЕНА*\n"
                             f"👤 {acc.name}\n"
@@ -3308,9 +4955,9 @@ async def monitoring_loop_ws(acc: AccountConfig, trader: PredictTrader, context:
         if event_type == 'orderTransactionFailed':
             logger.error(f"[{acc.name}] ❌ WS: транзакция ПРОВАЛИЛАСЬ | {outcome} qty={quantity} @ {price} | {market_question}")
             try:
-                if TELEGRAM_ADMIN_ID and bot_state.app:
+                if owner_chat_id and bot_state.app:
                     await bot_state.app.bot.send_message(
-                        chat_id=int(TELEGRAM_ADMIN_ID),
+                        chat_id=int(owner_chat_id),
                         text=(
                             f"❌ *ТРАНЗАКЦИЯ ПРОВАЛИЛАСЬ!*\n"
                             f"👤 {acc.name}\n"
@@ -3359,10 +5006,18 @@ async def monitoring_loop_ws(acc: AccountConfig, trader: PredictTrader, context:
             ws.jwt_token = trader.api.jwt_token
             await ws.subscribe_wallet_events()
         
-        # 5. Запускаем WebSocket listener как отдельную задачу
+        # 5. Сразу обрабатываем Phase 1 рынки (выставляем SELL ордера)
+        phase1_markets = [mid for mid, s in trader.markets.items() if s.split_phase == 1]
+        if phase1_markets:
+            logger.info(f"[{acc.name}] 🔄 Обнаружено {len(phase1_markets)} рынков в Phase 1, выставляем ордера...")
+            for mid in phase1_markets:
+                await handle_phase1_market(mid)
+                await asyncio.sleep(0.5)
+        
+        # 6. Запускаем WebSocket listener как отдельную задачу
         ws_task = asyncio.create_task(ws.listen())
         
-        # 6. Запускаем обработчик событий
+        # 7. Запускаем обработчик событий
         logger.info(f"[{acc.name}] ⚡ WebSocket мониторинг запущен! "
                     f"Рынков: {len(trader.markets)}, "
                     f"Обновление рынков: каждые {WS_MARKET_REFRESH_INTERVAL} сек, "
@@ -3402,7 +5057,7 @@ async def monitoring_loop_ws(acc: AccountConfig, trader: PredictTrader, context:
                         async with reposition_lock:
                             resolved = await asyncio.to_thread(trader.check_and_handle_resolved_markets)
                         if resolved:
-                            await send_resolved_market_notification(acc.name, resolved)
+                            await send_resolved_market_notification(acc.name, resolved, chat_id=owner_chat_id)
                             for res in resolved:
                                 mid = res['market_id']
                                 ps.update_market(addr, mid, split_phase=0,
@@ -3425,6 +5080,12 @@ async def monitoring_loop_ws(acc: AccountConfig, trader: PredictTrader, context:
                     for mid in old_markets - new_markets:
                         await ws.unsubscribe_orderbook(mid)
                         logger.info(f"[{acc.name}] ➖ Рынок удалён: #{mid}")
+                    
+                    # Обрабатываем Phase 1 рынки (новые или после SPLIT)
+                    phase1_markets = [mid for mid, s in trader.markets.items() if s.split_phase == 1]
+                    for mid in phase1_markets:
+                        await handle_phase1_market(mid)
+                        await asyncio.sleep(0.5)
                 
                 # Fallback polling — страховочная проверка
                 if now - last_fallback >= WS_FALLBACK_INTERVAL:
@@ -3438,7 +5099,7 @@ async def monitoring_loop_ws(acc: AccountConfig, trader: PredictTrader, context:
                         async with reposition_lock:
                             resolved = await asyncio.to_thread(trader.check_and_handle_resolved_markets)
                         if resolved:
-                            await send_resolved_market_notification(acc.name, resolved)
+                            await send_resolved_market_notification(acc.name, resolved, chat_id=owner_chat_id)
                             for res in resolved:
                                 mid = res['market_id']
                                 ps.update_market(addr, mid, split_phase=0,
@@ -3477,7 +5138,13 @@ async def monitoring_loop_ws(acc: AccountConfig, trader: PredictTrader, context:
                             
                             repositioned = result.get('repositioned', [])
                             if repositioned:
-                                await send_repositioning_notification(acc.name, repositioned)
+                                await send_repositioning_notification(
+                                    acc.name,
+                                    repositioned,
+                                    chat_id=owner_chat_id,
+                                    reposition_delay=trader.reposition_delay,
+                                    account_address=addr,
+                                )
                             
                             if fallback_cycle % 5 == 0:
                                 ps.save()
@@ -3512,7 +5179,8 @@ async def monitoring_loop_ws(acc: AccountConfig, trader: PredictTrader, context:
             f"Аккаунт: {acc.name}\n"
             f"WebSocket мониторинг упал!\n\n"
             f"{type(e).__name__}: {e}",
-            "WS MONITORING CRASH"
+            "WS MONITORING CRASH",
+            chat_id=owner_chat_id
         )
     finally:
         # Убеждаемся что WS закрыт
@@ -3614,6 +5282,7 @@ def main():
     
     # Split callbacks
     app.add_handler(CallbackQueryHandler(callback_split_account, pattern="^split_acc_"))
+    app.add_handler(CallbackQueryHandler(callback_split_type, pattern="^split_type_"))
     app.add_handler(CallbackQueryHandler(callback_split_market, pattern="^split_market_"))
     app.add_handler(CallbackQueryHandler(callback_split_amount, pattern="^split_amount_"))
     
@@ -3638,6 +5307,20 @@ def main():
     # Restart callbacks
     app.add_handler(CallbackQueryHandler(callback_restart_now, pattern="^restart_now$"))
     
+    # Registration callbacks
+    app.add_handler(CallbackQueryHandler(callback_register_done, pattern="^register_done$"))
+    app.add_handler(CallbackQueryHandler(callback_admin_approve, pattern="^admin_approve_"))
+    app.add_handler(CallbackQueryHandler(callback_admin_reject, pattern="^admin_reject_"))
+    
+    # Referral management callbacks (admin only)
+    app.add_handler(CallbackQueryHandler(callback_ref_list, pattern="^ref_list$"))
+    app.add_handler(CallbackQueryHandler(callback_ref_info, pattern="^ref_info_"))
+    app.add_handler(CallbackQueryHandler(callback_ref_logs, pattern="^ref_logs_"))
+    app.add_handler(CallbackQueryHandler(callback_ref_disable, pattern="^ref_disable_"))
+    app.add_handler(CallbackQueryHandler(callback_ref_enable, pattern="^ref_enable_"))
+    app.add_handler(CallbackQueryHandler(callback_ref_delete, pattern="^ref_delete_"))
+    app.add_handler(CallbackQueryHandler(callback_ref_confirm_delete, pattern="^ref_confirm_delete_"))
+    
     # Split pagination callbacks
     app.add_handler(CallbackQueryHandler(callback_split_page, pattern="^split_page_"))
     
@@ -3646,6 +5329,21 @@ def main():
     
     # Markets account selector callback
     app.add_handler(CallbackQueryHandler(callback_markets_account, pattern="^markets_acc_"))
+    
+    # Browse markets callbacks (обзор рынков с категориями и объёмами)
+    app.add_handler(CallbackQueryHandler(callback_browse_markets, pattern="^browse_markets_"))
+    app.add_handler(CallbackQueryHandler(callback_browse_page, pattern="^browse_page_"))
+    app.add_handler(CallbackQueryHandler(callback_browse_detail, pattern="^browse_detail_"))
+    app.add_handler(CallbackQueryHandler(callback_browse_split_acc, pattern="^browse_split_acc_"))
+    app.add_handler(CallbackQueryHandler(callback_browse_split_pick, pattern="^browse_split_pick_"))
+    app.add_handler(CallbackQueryHandler(callback_cmd_markets_menu, pattern="^cmd_markets_menu$"))
+    app.add_handler(CallbackQueryHandler(callback_my_positions, pattern="^my_positions$"))
+    
+    # NegRisk events callbacks (мульти-исходные события)
+    app.add_handler(CallbackQueryHandler(callback_browse_events, pattern="^browse_events$"))
+    app.add_handler(CallbackQueryHandler(callback_events_page, pattern="^events_page_"))
+    app.add_handler(CallbackQueryHandler(callback_event_sub_page, pattern="^event_sub_page_"))
+    app.add_handler(CallbackQueryHandler(callback_event_detail, pattern="^event_"))
     
     # Settings callbacks
     app.add_handler(CallbackQueryHandler(callback_settings_handler, pattern="^settings_"))
@@ -3670,21 +5368,35 @@ def main():
                 name='auto_update'
             )
             logger.info("Scheduled auto-update every 1 hour")
+            
+            # Очистка логов событий каждые 24 часа
+            async def scheduled_clear_logs(context: ContextTypes.DEFAULT_TYPE):
+                bot_state.clear_event_logs()
+            
+            job_queue.run_repeating(
+                scheduled_clear_logs,
+                interval=86400,  # 24 часа
+                first=86400,
+                name='clear_event_logs'
+            )
+            logger.info("Scheduled event log cleanup every 24 hours")
         
         bot_state.last_restart_time = datetime.now()
         
         # =====================================================================
-        # ВОССТАНОВЛЕНИЕ ЗАДАЧ ИЗ ПЕРСИСТЕНТНОГО СОСТОЯНИЯ
+        # ВОССТАНОВЛЕНИЕ ЗАДАЧ ИЗ ПЕРСИСТЕНТНОГО СОСТОЯНИЯ (МУЛЬТИ-ЮЗЕР)
         # =====================================================================
-        accounts = load_accounts()
-        accounts_by_addr = {acc.predict_account_address: acc for acc in accounts}
         
-        # Получаем адреса аккаунтов, которые были запущены до перезагрузки
+        # 1. Восстанавливаем аккаунты админа
+        admin_accounts = load_accounts()
+        accounts_by_addr = {acc.predict_account_address: acc for acc in admin_accounts}
+        
         addresses_to_restore = bot_state.get_accounts_to_restore()
         restored_count = 0
+        total_to_restore = len(addresses_to_restore)
         
         if addresses_to_restore:
-            logger.info(f"🔄 Восстанавливаем {len(addresses_to_restore)} задач мониторинга...")
+            logger.info(f"🔄 Восстанавливаем {len(addresses_to_restore)} задач мониторинга (админ)...")
             
             for addr in addresses_to_restore:
                 acc = accounts_by_addr.get(addr)
@@ -3693,8 +5405,7 @@ def main():
                     continue
                 
                 try:
-                    # Создаём фиктивный context для start_monitoring
-                    success = await _restore_monitoring(acc, application)
+                    success = await _restore_monitoring(acc, application, owner_id=TELEGRAM_ADMIN_ID)
                     if success:
                         restored_count += 1
                         logger.info(f"   ✅ {acc.name} — восстановлен")
@@ -3703,10 +5414,49 @@ def main():
                 except Exception as e:
                     logger.error(f"   ❌ {acc.name} — ошибка: {e}")
         
+        # 2. Восстанавливаем аккаунты рефералов
+        active_users = []
+        try:
+            um = get_user_manager()
+            active_users = [u for u in um.get_all_users() if u.status == 'active']
+            
+            for user_info in active_users:
+                uid = user_info.telegram_id
+                user_accounts = um.load_user_accounts(uid)
+                if not user_accounts:
+                    continue
+                
+                user_ps = bot_state.get_persistent_for_user(uid)
+                user_addrs = user_ps.get_running_accounts()
+                
+                if not user_addrs:
+                    continue
+                
+                user_accs_by_addr = {a.predict_account_address: a for a in user_accounts}
+                total_to_restore += len(user_addrs)
+                
+                logger.info(f"🔄 Восстанавливаем {len(user_addrs)} задач для {user_info.display_name}...")
+                
+                for addr in user_addrs:
+                    acc = user_accs_by_addr.get(addr)
+                    if not acc:
+                        continue
+                    try:
+                        success = await _restore_monitoring(acc, application, owner_id=uid)
+                        if success:
+                            restored_count += 1
+                            logger.info(f"   ✅ {acc.name} ({user_info.display_name}) — восстановлен")
+                        else:
+                            logger.error(f"   ❌ {acc.name} ({user_info.display_name}) — не удалось")
+                    except Exception as e:
+                        logger.error(f"   ❌ {acc.name} ({user_info.display_name}) — ошибка: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка восстановления рефералов: {e}")
+        
         # Сводка восстановления
         restore_text = ""
-        if addresses_to_restore:
-            restore_text = f"\n🔄 Восстановлено задач: {restored_count}/{len(addresses_to_restore)}"
+        if total_to_restore > 0:
+            restore_text = f"\n🔄 Восстановлено задач: {restored_count}/{total_to_restore}"
             
             # Информация о рынках из персистентного состояния
             ps = bot_state.persistent
@@ -3723,7 +5473,8 @@ def main():
                     text=(
                         "✅ *Бот запущен!*\n\n"
                         f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                        f"👥 Аккаунтов: {len(accounts)}\n"
+                        f"👥 Аккаунтов (админ): {len(admin_accounts)}\n"
+                        f"👤 Рефералов: {len(active_users) if active_users else 0}\n"
                         f"📡 Мониторинг: {'⚡ WebSocket (real-time)' if USE_WEBSOCKET else '🔄 Polling'}\n"
                         f"📬 Уведомления об ошибках: Включены\n"
                         f"🔄 Автообновление: каждый час (git pull + restart)"

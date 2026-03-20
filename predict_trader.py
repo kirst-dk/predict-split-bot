@@ -45,7 +45,7 @@ import sys
 import time
 import logging
 import argparse
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 
@@ -58,7 +58,9 @@ load_dotenv()
 from config import (
     API_KEY, PRIVATE_KEY, PRIVY_WALLET_PRIVATE_KEY, PREDICT_ACCOUNT_ADDRESS,
     CHAIN_ID, ChainId, RPC_URL,
-    SPLIT_OFFSET, CHECK_INTERVAL, REPOSITION_COOLDOWN, ASK_POSITION_OFFSET,
+    SPLIT_OFFSET, CHECK_INTERVAL, REPOSITION_DELAY, ASK_POSITION_OFFSET,
+    AUTO_MARKET_EXIT_ON_FULL_FILL,
+    TAKER_BASE_FEE_BPS, FEE_DISCOUNT,
     MIN_ORDER_USDT, MAX_ORDERS_PER_MARKET,
     validate_config, print_config,
     # Мульти-аккаунты
@@ -217,6 +219,14 @@ class MarketState:
     last_reposition_yes: Optional[datetime] = None
     last_reposition_no: Optional[datetime] = None
     
+    # Время последней отмены ордера (для REPOSITION_DELAY задержки перед новым ордером)
+    last_cancel_yes: Optional[datetime] = None
+    last_cancel_no: Optional[datetime] = None
+
+    # Пауза рынка после 100% исполнения одной стороны:
+    # отменяем вторую сторону и не перевыставляем автоматически
+    halt_after_full_fill: bool = False
+    
     # Статистика
     last_update: Optional[datetime] = None
     errors_count: int = 0
@@ -251,6 +261,8 @@ class PredictTrader:
         strategy: str = 'split',
         order_amount: float = None,  # Обязательно для SPLIT (нет default)
         split_offset: float = SPLIT_OFFSET,
+        ask_position_offset: int = ASK_POSITION_OFFSET,
+        reposition_delay: int = REPOSITION_DELAY,
         monitor_mode: bool = False,  # Режим мониторинга (не создавать новые SPLIT)
         account: AccountConfig = None,  # Конфиг аккаунта (для мульти-аккаунт режима)
     ):
@@ -261,6 +273,8 @@ class PredictTrader:
             strategy: Стратегия торговли ('split')
             order_amount: Размер ордера в USDT
             split_offset: Отступ от лучшего ASK для SPLIT (0.01 = 1 цент)
+            ask_position_offset: Отступ от best ASK в тиках для позиции SELL
+            reposition_delay: Задержка после отмены перед созданием нового ордера (сек)
             monitor_mode: Только мониторинг существующих позиций
             account: Конфигурация аккаунта (если None - используется из .env)
         """
@@ -280,6 +294,9 @@ class PredictTrader:
         self.strategy = strategy
         self.order_amount = max(MIN_ORDER_USDT, order_amount) if order_amount is not None else MIN_ORDER_USDT
         self.split_offset = split_offset
+        self.ask_position_offset = max(1, int(ask_position_offset))
+        self.reposition_delay = max(0, int(reposition_delay))
+        self.auto_market_exit_on_full_fill = bool(AUTO_MARKET_EXIT_ON_FULL_FILL)
         self.monitor_mode = monitor_mode
         
         # API клиент (один на всех!)
@@ -326,6 +343,9 @@ class PredictTrader:
         logger.info(f"   Рынков: {len(self.market_ids) if self.market_ids else 'авто'}")
         logger.info(f"   Размер ордера: ${self.order_amount:.2f}")
         logger.info(f"   SPLIT offset: {split_offset*100:.1f}%")
+        logger.info(f"   ASK position offset: {self.ask_position_offset}")
+        logger.info(f"   Reposition delay: {self.reposition_delay}с")
+        logger.info(f"   Auto market-exit on full fill: {self.auto_market_exit_on_full_fill}")
     
     # =========================================================================
     # ИНИЦИАЛИЗАЦИЯ
@@ -649,6 +669,85 @@ class PredictTrader:
         except Exception as e:
             logger.error(f"Ошибка получения баланса: {e}")
             return 0.0
+
+    def _extract_points_from_account_data(self, account_data: Dict[str, Any]) -> Optional[float]:
+        """Извлечь значение Predict Points из произвольной структуры /v1/account."""
+        if not isinstance(account_data, dict):
+            return None
+
+        preferred_keys = [
+            'totalPredictPoints',
+            'predictPoints',
+            'pointsTotal',
+            'totalPoints',
+            'points',
+            'rewardPoints',
+            'pointsBalance',
+            'pp',
+        ]
+
+        for key in preferred_keys:
+            value = account_data.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str):
+                try:
+                    return float(value)
+                except ValueError:
+                    pass
+
+        points_obj = account_data.get('points')
+        if isinstance(points_obj, dict):
+            total = points_obj.get('total')
+            if isinstance(total, (int, float)):
+                return float(total)
+            if isinstance(total, str):
+                try:
+                    return float(total)
+                except ValueError:
+                    pass
+
+        candidates: List[float] = []
+
+        def walk(obj: Any):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    key_l = str(key).lower()
+                    if 'point' in key_l and isinstance(value, (int, float)):
+                        candidates.append(float(value))
+                    elif 'point' in key_l and isinstance(value, str):
+                        try:
+                            candidates.append(float(value))
+                        except ValueError:
+                            pass
+                    walk(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    walk(item)
+
+        walk(account_data)
+
+        if candidates:
+            return max(candidates)
+
+        return None
+
+    def get_predict_points(self) -> Optional[float]:
+        """
+        Получить Predict Points (PP) через REST API аккаунта.
+
+        Returns:
+            Количество PP или None если API не вернуло значение.
+        """
+        try:
+            if not self.api.jwt_token:
+                return None
+
+            account_data = self.api.get_account()
+            return self._extract_points_from_account_data(account_data)
+        except Exception as e:
+            logger.debug(f"Не удалось получить PP через /v1/account: {e}")
+            return None
     
     def update_positions(self):
         """
@@ -777,6 +876,87 @@ class PredictTrader:
         
         return api_order
     
+    def get_target_ask_price(self, token: str, exclude_price: float = None,
+                             exclude_quantity: float = 0) -> Optional[float]:
+        """
+        Вычислить целевую цену SELL ордера на основе ПОЗИЦИИ в стакане.
+        
+        Вместо простого добавления N тиков к best ASK (что даёт разные позиции
+        в зависимости от плотности стакана), метод находит N-й ценовой уровень
+        в стакане и ставит на 1 тик выше него.
+        
+        Это гарантирует одинаковую позицию в стакане на ВСЕХ рынках:
+          offset=1 → 2-е место (за best ASK)
+          offset=2 → 3-е место
+          offset=3 → 4-е место
+        
+        Args:
+            token: 'YES' или 'NO'
+            exclude_price: Если наш ордер стоит по этой цене — вычесть наши шары
+            exclude_quantity: Количество наших шар для вычитания из уровня
+            
+        Returns:
+            Целевая цена или None
+        """
+        if not self.orderbook or not self.market:
+            return None
+        
+        precision = self.market.decimal_precision
+        min_tick = 10 ** (-precision)
+        max_price = 1.0 - min_tick
+        
+        # Получаем все ASK уровни (отсортированы по возрастанию цены)
+        if token.upper() == 'YES':
+            ask_levels = list(self.orderbook.get_yes_asks())
+        else:
+            ask_levels = list(self.orderbook.get_no_asks(precision))
+        
+        if not ask_levels:
+            return None
+        
+        # Вычитаем наш собственный ордер из уровня (если указан)
+        # Если на уровне остаются чужие шары — уровень сохраняется
+        if exclude_price is not None:
+            filtered = []
+            for level in ask_levels:
+                if abs(level.price - exclude_price) <= min_tick / 2:
+                    # Это наш уровень — вычитаем наши шары
+                    remaining = level.quantity - exclude_quantity
+                    if remaining > 0.5:
+                        # На уровне есть чужие шары — оставляем уровень
+                        from predict_api import OrderbookLevel
+                        filtered.append(OrderbookLevel(price=level.price, quantity=remaining))
+                else:
+                    filtered.append(level)
+            ask_levels = filtered
+        
+        if not ask_levels:
+            return None
+        
+        # Собираем уникальные ценовые уровни
+        unique_prices = []
+        for level in ask_levels:
+            if not unique_prices or abs(level.price - unique_prices[-1]) > min_tick / 2:
+                unique_prices.append(level.price)
+        
+        offset = self.ask_position_offset
+        
+        if offset <= len(unique_prices):
+            # Достаточно уровней — ставим на 1 тик выше N-го уровня
+            target = round(unique_prices[offset - 1] + min_tick, precision)
+        else:
+            # Недостаточно уровней — экстраполируем от последнего
+            last_price = unique_prices[-1]
+            extra_ticks = offset - len(unique_prices)
+            target = round(last_price + min_tick * (extra_ticks + 1), precision)
+        
+        target = round(min(target, max_price), precision)
+        
+        logger.debug(f"   🎯 {token}: offset={offset}, уровней={len(unique_prices)}, "
+                    f"target={target:.{precision}f} (уровни: {[f'{p:.{precision}f}' for p in unique_prices[:offset+1]]})")
+        
+        return target
+
     def calculate_sell_prices(self) -> Tuple[Optional[float], Optional[float]]:
         """
         Вычислить цены для SELL ордеров (2-е место в стакане)
@@ -1758,6 +1938,10 @@ class PredictTrader:
             if not split_success:
                 result['message'] = 'Не удалось выполнить SPLIT'
                 return result
+
+            ms = self.markets.get(self.market_id)
+            if ms:
+                ms.halt_after_full_fill = False
             
             self.split_phase = 1
             result['success'] = True
@@ -1774,7 +1958,15 @@ class PredictTrader:
         elif self.split_phase >= 1:
             # Проверяем позиции
             self.update_positions()
-            
+
+            # Пауза рынка (используется в режиме без market-exit)
+            ms = self.markets.get(self.market_id)
+            if ms and ms.halt_after_full_fill:
+                result['success'] = True
+                result['phase'] = self.split_phase
+                result['message'] = 'Рынок на паузе после 100% fill одной стороны (market-exit выключен)'
+                return result
+
             # ИСПРАВЛЕНИЕ: используем AND вместо OR!
             # Если ОДНА сторона продана (fill) — нужно создать ордер для ДРУГОЙ стороны.
             # Блокируем только если ОБЕИХ позиций нет (нечего продавать).
@@ -1857,43 +2049,41 @@ class PredictTrader:
                     import time
                     time.sleep(0.5)
             
-            # Рассчитываем цены для SELL
-            # ВАЖНО: ставим на 2-е место, НЕ на 1-е!
-            # yes_ask и no_ask - это текущие лучшие цены (чужие ордера)
-            # Мы ставим на минимальный шаг выше них (0.1 цента = 0.001)
-            precision = self.market.decimal_precision  # Обычно 3 знака
-            min_tick = 10 ** (-precision)  # Минимальный шаг цены (0.001 для precision=3)
+            # Рассчитываем цены для SELL по ПОЗИЦИИ в стакане
+            # ASK_POSITION_OFFSET = N → бот будет на (N+1)-м месте:
+            #   offset=1 → за лучшим ASK (2-е место)
+            #   offset=2 → за 2-м уровнем (3-е место)
+            #   offset=3 → за 3-м уровнем (4-е место)
+            precision = self.market.decimal_precision
+            min_tick = 10 ** (-precision)
             
-            # ВАЖНО: всегда используем min_tick для минимального отступа
-            # Это 0.001 = 0.1 цента - минимальный шаг на бирже
-            # НЕ используем split_offset здесь - он слишком большой!
+            # Позиционное размещение: ищем N-й реальный уровень в стакане
+            yes_sell_price = self.get_target_ask_price('YES')
+            no_sell_price = self.get_target_ask_price('NO')
             
-            yes_sell_price = round(yes_ask + min_tick, precision)
-            no_sell_price = round(no_ask + min_tick, precision)
+            # Fallback если стакан пуст
+            if yes_sell_price is None:
+                yes_sell_price = round(yes_ask + min_tick * self.ask_position_offset, precision)
+            if no_sell_price is None:
+                no_sell_price = round(no_ask + min_tick * self.ask_position_offset, precision)
             
             # Проверяем, что цены валидны (< 0.999 для precision=3)
-            max_price = 1.0 - min_tick  # 0.999 для precision=3
+            max_price = 1.0 - min_tick
             yes_sell_price = min(yes_sell_price, max_price)
             no_sell_price = min(no_sell_price, max_price)
             
-            logger.info(f"📈 Цены SELL (2-е место): YES @ {yes_sell_price:.3f}, NO @ {no_sell_price:.3f}")
+            position_name = self.ask_position_offset + 1  # offset=3 → 4-е место
+            logger.info(f"📈 Цены SELL ({position_name}-е место, offset={self.ask_position_offset}): YES @ {yes_sell_price:.3f}, NO @ {no_sell_price:.3f}")
             logger.info(f"   (Лучшие ASK: YES={yes_ask:.3f}, NO={no_ask:.3f})")
             
             orders_placed = 0
             
-            # ВАЖНО: используем order_amount как целевое количество для продажи
-            # При SPLIT мы получаем ТОЧНО order_amount токенов YES и NO
-            # Поэтому используем order_amount, проверяя что позиция достаточна
-            sell_quantity_target = self.order_amount
-            
             # Выставляем SELL YES (только если ордера ещё нет!)
             if not has_yes_order and self.yes_position > 0:
-                # Используем order_amount если позиция достаточна, иначе всю позицию
-                # Это исправляет ошибку когда ордер создавался на меньшую сумму
-                if self.yes_position >= sell_quantity_target:
-                    sell_quantity = sell_quantity_target
-                else:
-                    sell_quantity = self.yes_position
+                # Используем ВСЮ позицию для SELL
+                # (при мониторинге order_amount может быть дефолтным 1.0,
+                #  а реальная позиция — 105 шар после SPLIT)
+                sell_quantity = self.yes_position
                 sell_quantity = int(sell_quantity * 100000) / 100000
                 
                 logger.info(f"   YES: позиция={self.yes_position:.4f}, order_amount={self.order_amount:.4f}, sell_quantity={sell_quantity:.4f}")
@@ -1921,11 +2111,8 @@ class PredictTrader:
             
             # Выставляем SELL NO (только если ордера ещё нет!)
             if not has_no_order and self.no_position > 0:
-                # Используем order_amount если позиция достаточна, иначе всю позицию
-                if self.no_position >= sell_quantity_target:
-                    sell_quantity = sell_quantity_target
-                else:
-                    sell_quantity = self.no_position
+                # Используем ВСЮ позицию для SELL
+                sell_quantity = self.no_position
                 sell_quantity = int(sell_quantity * 100000) / 100000
                 
                 logger.info(f"   NO: позиция={self.no_position:.4f}, order_amount={self.order_amount:.4f}, sell_quantity={sell_quantity:.4f}")
@@ -2005,11 +2192,19 @@ class PredictTrader:
             logger.warning(f"   ⛔ {token}: поднимаем до {safe_price:.{precision}f}")
             target_price = safe_price
         
-        # === Доп. проверка: не быть лучшим ASK ===
-        if best_ask is not None and abs(target_price - best_ask) < min_tick / 2:
-            # Мы были бы лучшим ASK — опасно!
-            target_price = best_ask + min_tick
-            logger.warning(f"   ⚠️ {token}: стали бы лучшим ASK, сдвигаем на {target_price:.{precision}f}")
+        # === Пересчёт позиции по актуальному стакану (ПОЗИЦИОННОЕ размещение) ===
+        # Используем get_target_ask_price для точного N-го места в стакане
+        optimal_price = self.get_target_ask_price(token)
+        if optimal_price is not None:
+            if abs(target_price - optimal_price) > min_tick / 2:
+                logger.info(f"   📊 {token}: корректировка по позиции в стакане: "
+                           f"{target_price:.{precision}f} → {optimal_price:.{precision}f} "
+                           f"(offset={self.ask_position_offset}, место #{self.ask_position_offset + 1})")
+                target_price = optimal_price
+            elif best_ask is not None and target_price <= best_ask + min_tick / 2:
+                # Мы были бы лучшим ASK или слишком близко — опасно!
+                target_price = optimal_price
+                logger.warning(f"   ⚠️ {token}: стали бы лучшим ASK, сдвигаем на {target_price:.{precision}f} (место #{self.ask_position_offset + 1})")
         
         target_price = round(min(target_price, max_price), precision)
         
@@ -2114,25 +2309,53 @@ class PredictTrader:
             # СРОЧНО ОТМЕНЯЕМ остаток!
             self.cancel_order(order.id)
             time.sleep(0.5)
-            order = None  # Пересоздадим ниже
+            order = None  # Пересоздадим после задержки
+            # Записываем время отмены — новый ордер будет создан после REPOSITION_DELAY
+            if ms:
+                if is_yes:
+                    ms.last_cancel_yes = datetime.now()
+                else:
+                    ms.last_cancel_no = datetime.now()
+            logger.info(f"   ⏳ {token}: ждём {self.reposition_delay}с после отмены (стабилизация стакана)")
+            return True
         
         # =================================================================
-        # 2. ЕСЛИ ОРДЕРА НЕТ — создаём новый СРАЗУ
+        # 2. ЕСЛИ ОРДЕРА НЕТ — создаём новый (с учётом REPOSITION_DELAY)
         # =================================================================
         if order is None:
             position = self.yes_position if is_yes else self.no_position
             if position >= 0.5:
+                # Проверяем задержку после последней отмены (REPOSITION_DELAY)
+                if ms:
+                    last_cancel = ms.last_cancel_yes if is_yes else ms.last_cancel_no
+                    if last_cancel:
+                        elapsed = (datetime.now() - last_cancel).total_seconds()
+                        if elapsed < self.reposition_delay:
+                            remaining = self.reposition_delay - elapsed
+                            logger.info(f"   ⏳ {token}: ожидание {remaining:.0f}с после отмены "
+                                       f"(REPOSITION_DELAY={self.reposition_delay}с, прошло {elapsed:.0f}с)")
+                            return False
+                
                 logger.info(f"   ⚠️ {token}: ордера нет, создаём...")
                 
-                if is_yes:
-                    best_ask = self.orderbook.get_best_yes_ask()
-                else:
-                    best_ask = self.orderbook.get_best_no_ask(precision)
+                # Обновляем ордербук — получаем АКТУАЛЬНЫЕ цены после REPOSITION_DELAY
+                self.update_orderbook()
                 
-                if best_ask:
-                    target_price = best_ask + min_tick * ASK_POSITION_OFFSET
+                # Позиционное размещение: ищем N-й реальный уровень в стакане
+                target_price = self.get_target_ask_price(token)
+                if target_price:
+                    logger.info(f"   📊 {token}: позиционное размещение → "
+                               f"target={target_price:.{precision}f} (место #{self.ask_position_offset + 1})")
                 else:
-                    target_price = 0.50
+                    # Fallback: стакан пуст
+                    if is_yes:
+                        best_ask = self.orderbook.get_best_yes_ask()
+                    else:
+                        best_ask = self.orderbook.get_best_no_ask(precision)
+                    if best_ask:
+                        target_price = round(best_ask + min_tick * self.ask_position_offset, precision)
+                    else:
+                        target_price = 0.50
                 
                 target_price = round(min(target_price, max_price), precision)
                 
@@ -2157,9 +2380,6 @@ class PredictTrader:
                 if abs(level.price - our_price) > min_tick / 2:
                     best_other_ask = level.price
                     break
-            
-            we_are_best = (self.orderbook.best_ask is not None and 
-                          abs(our_price - self.orderbook.best_ask) < min_tick / 2)
         else:
             # Ищем лучший NO ASK который НЕ наш
             no_asks = self.orderbook.get_no_asks(precision)
@@ -2168,10 +2388,6 @@ class PredictTrader:
                 if abs(level.price - our_price) > min_tick / 2:
                     best_other_ask = level.price
                     break
-            
-            current_best_no_ask = self.orderbook.get_best_no_ask(precision)
-            we_are_best = (current_best_no_ask is not None and 
-                          abs(our_price - current_best_no_ask) < min_tick / 2)
         
         # =================================================================
         # 3a. МЫ ЕДИНСТВЕННЫЕ В СТАКАНЕ
@@ -2193,80 +2409,34 @@ class PredictTrader:
             return False
         
         # =================================================================
-        # 3b. 🚨 МЫ ЛУЧШИЙ ASK — КРИТИЧЕСКАЯ ОПАСНОСТЬ!
+        # 3b. ПРОВЕРКА ОТКЛОНЕНИЯ ОТ ЦЕЛЕВОЙ ПОЗИЦИИ (ASK_POSITION_OFFSET)
         # =================================================================
-        if we_are_best:
-            # Cooldown: проверяем, не слишком ли часто переставляем
-            if ms:
-                last_repo = ms.last_reposition_yes if is_yes else ms.last_reposition_no
-                if last_repo:
-                    elapsed = (datetime.now() - last_repo).total_seconds()
-                    # Для критической ситуации (мы лучший ASK) — cooldown в 2 раза короче
-                    critical_cooldown = max(REPOSITION_COOLDOWN / 2, 2)
-                    if elapsed < critical_cooldown:
-                        logger.info(f"   ⏳ {token}: МЫ ЛУЧШИЙ ASK, но cooldown {critical_cooldown:.0f}с "
-                                   f"(прошло {elapsed:.1f}с). Ждём.")
-                        return False
-            
-            logger.warning(f"   🚨 {token}: МЫ ЛУЧШИЙ ASK ({our_price:.{precision}f})! ОТМЕНА + ПЕРЕСТАВЛЕНИЕ!")
-            # Запоминаем количество из ордера ДО отмены
-            reposition_quantity = order.quantity if hasattr(order, 'quantity') else order.original_quantity
-            # СНАЧАЛА ОТМЕНЯЕМ
-            self.cancel_order(order.id)
-            time.sleep(0.5)
-            
-            # СРАЗУ ставим новый ордер на 2-е место (безопасность через _safe_sell_price)
-            # Передаём known_quantity — blockchain может показать 0 для залоченных токенов
-            new_target = round(min(best_other_ask + min_tick * ASK_POSITION_OFFSET, max_price), precision)
-            new_hash = self._create_safe_sell_order(token, new_target, result,
-                                                    known_quantity=reposition_quantity)
-            
-            # Запоминаем время переставления
-            if ms:
-                if is_yes:
-                    ms.last_reposition_yes = datetime.now()
-                else:
-                    ms.last_reposition_no = datetime.now()
-            
-            if new_hash:
-                logger.info(f"   ✅ {token}: переставлен на {new_target:.{precision}f} (было {our_price:.{precision}f})")
-            else:
-                logger.warning(f"   ⚠️ {token}: не удалось переставить, будет создан в следующем цикле")
-            
-            result['repositioned'].append({
-                'token': token,
-                'old_price': our_price,
-                'new_price': new_target,
-                'quantity': self.yes_position if is_yes else self.no_position,
-                'delayed': False,
-            })
-            result['updated'] += 1
-            return True
-        
-        # =================================================================
-        # 3c. НОРМАЛЬНАЯ СИТУАЦИЯ — проверяем, на 2-м ли мы месте
-        # =================================================================
-        # Мы не лучший ASK. best_other_ask — это лучший чужой ASK (перед нами).
-        # Целевая: best_other_ask + N ticks (стать ЗА ним с отступом ASK_POSITION_OFFSET)
-        target_price = best_other_ask + min_tick * ASK_POSITION_OFFSET
+        # Позиционное размещение: ищем N-й реальный уровень в стакане,
+        # вычитая наши шары из уровня (чужие шары на том же уровне сохраняются)
+        our_qty = order.original_quantity if hasattr(order, 'original_quantity') else 0
+        positional_target = self.get_target_ask_price(token, exclude_price=our_price, exclude_quantity=our_qty)
+        if positional_target is not None:
+            target_price = positional_target
+        else:
+            # Fallback на тиковый расчёт
+            target_price = best_other_ask + min_tick * self.ask_position_offset
         target_price = round(min(target_price, max_price), precision)
         
         price_diff = abs(our_price - target_price)
         
         if price_diff > min_tick / 2:
-            # Cooldown: не переставляем чаще чем раз в REPOSITION_COOLDOWN секунд
-            if ms:
-                last_repo = ms.last_reposition_yes if is_yes else ms.last_reposition_no
-                if last_repo:
-                    elapsed = (datetime.now() - last_repo).total_seconds()
-                    if elapsed < REPOSITION_COOLDOWN:
-                        logger.info(f"   ⏳ {token}: нужно переставить "
-                                   f"({our_price:.{precision}f} → {target_price:.{precision}f}), "
-                                   f"но cooldown {REPOSITION_COOLDOWN}с (прошло {elapsed:.1f}с)")
-                        return False
+            tick_deviation = round(price_diff / min_tick)
             
-            reason = f"цена {our_price:.{precision}f} != целевая {target_price:.{precision}f}"
-            logger.info(f"   🔄 {token}: переставляем ({reason})")
+            if our_price < target_price:
+                # Слишком близко к best ASK — опасность филла!
+                logger.warning(f"   🚨 {token}: слишком БЛИЗКО к best ASK! "
+                             f"цена {our_price:.{precision}f}, целевая {target_price:.{precision}f} "
+                             f"(отклонение -{tick_deviation} тик, best_other={best_other_ask:.{precision}f})")
+            else:
+                # Слишком далеко — теряем поинты
+                logger.info(f"   🔄 {token}: слишком ДАЛЕКО от best ASK: "
+                           f"цена {our_price:.{precision}f}, целевая {target_price:.{precision}f} "
+                           f"(отклонение +{tick_deviation} тик, best_other={best_other_ask:.{precision}f})")
             
             # Запоминаем количество из ордера ДО отмены
             reposition_quantity = order.quantity if hasattr(order, 'quantity') else order.original_quantity
@@ -2274,30 +2444,26 @@ class PredictTrader:
             if self.cancel_order(order.id):
                 time.sleep(0.5)
                 
-                # СРАЗУ ставим новый ордер (безопасность через _safe_sell_price)
-                # Передаём known_quantity — blockchain может показать 0 для залоченных токенов
-                new_hash = self._create_safe_sell_order(token, target_price, result,
-                                                        known_quantity=reposition_quantity)
-                
-                # Запоминаем время переставления
+                # Записываем время отмены — новый ордер будет создан после REPOSITION_DELAY
                 if ms:
                     if is_yes:
+                        ms.last_cancel_yes = datetime.now()
                         ms.last_reposition_yes = datetime.now()
                     else:
+                        ms.last_cancel_no = datetime.now()
                         ms.last_reposition_no = datetime.now()
                 
-                if new_hash:
-                    logger.info(f"   ✅ {token}: переставлен на {target_price:.{precision}f} (было {our_price:.{precision}f})")
-                else:
-                    logger.warning(f"   ⚠️ {token}: не удалось переставить, будет создан в следующем цикле")
+                logger.info(f"   ⏳ {token}: ордер отменён, ждём {self.reposition_delay}с перед новым ордером "
+                           f"(стабилизация стакана)")
                 
                 result['repositioned'].append({
                     'token': token,
                     'old_price': our_price,
                     'new_price': target_price,
                     'quantity': self.yes_position if is_yes else self.no_position,
-                    'delayed': False,
+                    'delayed': True,
                 })
+                result['updated'] += 1
             return True
         else:
             logger.debug(f"   {token} OK: цена {our_price:.{precision}f}, целевая {target_price:.{precision}f}")
@@ -2309,12 +2475,13 @@ class PredictTrader:
         
         МНОГОУРОВНЕВАЯ ЗАЩИТА ОТ ИСПОЛНЕНИЯ:
         ===================================
-        1. Частичное исполнение → мгновенная отмена + уведомление
-        2. Мы лучший ASK → мгновенная отмена + новый ордер (cooldown REPOSITION_COOLDOWN/2 сек)
-        3. Цена не на 2-м месте → отмена + новый ордер (cooldown REPOSITION_COOLDOWN сек)
-        4. Перед созданием ордера → перечитываем ордербук и проверяем цену
-        5. Цена SELL ВСЕГДА строго выше best BID (никогда не пересечёт спред)
-        6. Не становимся лучшим ASK при создании
+        1. Частичное исполнение → мгновенная отмена + ожидание REPOSITION_DELAY
+        2. Отклонение от ASK_POSITION_OFFSET на ≥1 тик (ближе ИЛИ дальше) → отмена
+        3. После отмены бот ждёт REPOSITION_DELAY секунд (стабилизация стакана)
+        4. Новый ордер создаётся только когда стакан стабилен
+        5. Перед созданием ордера → перечитываем ордербук и проверяем цену
+        6. Цена SELL ВСЕГДА строго выше best BID (никогда не пересечёт спред)
+        7. Не становимся лучшим ASK при создании
         
         Returns:
             Результат проверки {'updated': int, 'message': str}
@@ -2356,7 +2523,8 @@ class PredictTrader:
             
             has_yes = self.yes_position >= 0.5
             has_no = self.no_position >= 0.5
-            
+            ms = self.markets.get(self.market_id)
+
             if not has_yes and not has_no:
                 # Обе стороны проданы — нечего делать
                 logger.warning("   Обе стороны проданы, позиций нет.")
@@ -2415,6 +2583,102 @@ class PredictTrader:
         
         # Обновляем позиции
         self.update_positions()
+
+        # FULL-FILL ONLY режим:
+        # если одна сторона исполнена на 100%, отменяем вторую и ставим рынок на паузу.
+        ms = self.markets.get(self.market_id)
+        yes_fully_filled = (yes_order is None and self.yes_position < 0.1)
+        no_fully_filled = (no_order is None and self.no_position < 0.1)
+
+        if yes_fully_filled and no_order is not None:
+            if not self.auto_market_exit_on_full_fill:
+                logger.warning("🚨 YES исполнен на 100% — market-exit выключен, отменяем NO и ставим паузу")
+                if self.cancel_order(no_order.id):
+                    if ms:
+                        ms.last_cancel_no = datetime.now()
+                        ms.halt_after_full_fill = True
+                    result['updated'] += 1
+                    result['no_updated'] = True
+                    result['message'] = 'YES исполнен полностью: NO ордер отменён, рынок на паузе'
+                    self.split_phase = 1
+                    return result
+
+            logger.warning("🚨 YES исполнен на 100% — закрываем NO рыночным ордером")
+            if self.cancel_order(no_order.id):
+                if ms:
+                    ms.last_cancel_no = datetime.now()
+                    ms.halt_after_full_fill = False
+                time.sleep(0.2)
+                self.update_positions()
+                close_qty = self.no_position
+                if close_qty >= 0.5:
+                    self.update_orderbook()
+                    no_bid, _ = self.orderbook.get_no_prices(self.market.decimal_precision)
+                    market_price = no_bid if no_bid is not None else 0.01
+                    close_hash = self.create_limit_order(
+                        side='SELL',
+                        token='NO',
+                        price=market_price,
+                        quantity=close_qty,
+                        skip_guard=True,
+                        skip_balance_check=True,
+                    )
+                    if close_hash:
+                        result['updated'] += 1
+                        result['no_updated'] = True
+                        result['message'] = 'YES исполнен полностью: NO закрыт по рынку'
+                        self.split_phase = 1
+                        return result
+                    result['message'] = 'YES исполнен полностью: не удалось закрыть NO по рынку'
+                    return result
+                result['message'] = 'YES исполнен полностью: NO позиция уже пустая'
+                self.split_phase = 0
+                return result
+
+        if no_fully_filled and yes_order is not None:
+            if not self.auto_market_exit_on_full_fill:
+                logger.warning("🚨 NO исполнен на 100% — market-exit выключен, отменяем YES и ставим паузу")
+                if self.cancel_order(yes_order.id):
+                    if ms:
+                        ms.last_cancel_yes = datetime.now()
+                        ms.halt_after_full_fill = True
+                    result['updated'] += 1
+                    result['yes_updated'] = True
+                    result['message'] = 'NO исполнен полностью: YES ордер отменён, рынок на паузе'
+                    self.split_phase = 1
+                    return result
+
+            logger.warning("🚨 NO исполнен на 100% — закрываем YES рыночным ордером")
+            if self.cancel_order(yes_order.id):
+                if ms:
+                    ms.last_cancel_yes = datetime.now()
+                    ms.halt_after_full_fill = False
+                time.sleep(0.2)
+                self.update_positions()
+                close_qty = self.yes_position
+                if close_qty >= 0.5:
+                    self.update_orderbook()
+                    yes_bid = self.orderbook.best_bid
+                    market_price = yes_bid if yes_bid is not None else 0.01
+                    close_hash = self.create_limit_order(
+                        side='SELL',
+                        token='YES',
+                        price=market_price,
+                        quantity=close_qty,
+                        skip_guard=True,
+                        skip_balance_check=True,
+                    )
+                    if close_hash:
+                        result['updated'] += 1
+                        result['yes_updated'] = True
+                        result['message'] = 'NO исполнен полностью: YES закрыт по рынку'
+                        self.split_phase = 1
+                        return result
+                    result['message'] = 'NO исполнен полностью: не удалось закрыть YES по рынку'
+                    return result
+                result['message'] = 'NO исполнен полностью: YES позиция уже пустая'
+                self.split_phase = 0
+                return result
         
         # Обрабатываем YES
         self._process_side_order('YES', yes_order, result)
@@ -2892,13 +3156,11 @@ class PredictTrader:
                     # Вызываем strategy_split для выставления ордеров
                     result = self.strategy_split()
                     
-                    if result.get('success') or result.get('phase') == 2:
+                    placed = result.get('orders_placed', 0)
+                    if placed > 0:
                         state.split_phase = 2
-                        orders_placed += result.get('orders_placed', 0)
-                        logger.info(f"   ✅ Ордера выставлены!")
-                    elif result.get('orders_placed', 0) > 0:
-                        orders_placed += result['orders_placed']
-                        logger.info(f"   ⚠️ Частично выставлено: {result['orders_placed']} ордеров")
+                        orders_placed += placed
+                        logger.info(f"   ✅ Выставлено {placed} ордеров!")
                     else:
                         logger.warning(f"   ⚠️ {result.get('message', 'Не удалось выставить ордера')}")
                         
@@ -3117,20 +3379,35 @@ class PredictTrader:
             else:
                 logger.info(f"ℹ️  Уже есть достаточно позиций: YES={self.yes_position:.2f}, NO={self.no_position:.2f}")
             
-            # ФАЗА 2: Выставление SELL ордеров
+            # ФАЗА 2: Выставление SELL ордеров по позиции ASK_POSITION_OFFSET
             logger.info("🔄 ФАЗА 2: Выставление SELL ордеров...")
             
             # Обновляем ордербук
             self.update_orderbook()
             
-            # Вычисляем цены для 2-го места
-            yes_sell_price, no_sell_price = self.calculate_sell_prices()
+            precision = self.market.decimal_precision
+            min_tick = 10 ** (-precision)
+            
+            # Позиционное размещение: находим N-й реальный уровень в стакане
+            yes_sell_price = self.get_target_ask_price('YES')
+            no_sell_price = self.get_target_ask_price('NO')
+            
+            # Fallback на тиковый расчёт если стакан пуст
+            if not yes_sell_price:
+                yes_ask = self.orderbook.get_best_yes_ask()
+                if yes_ask:
+                    yes_sell_price = round(yes_ask + min_tick * self.ask_position_offset, precision)
+            if not no_sell_price:
+                no_ask = self.orderbook.get_best_no_ask(precision)
+                if no_ask:
+                    no_sell_price = round(no_ask + min_tick * self.ask_position_offset, precision)
             
             if not yes_sell_price or not no_sell_price:
                 logger.error("❌ Не удалось вычислить цены!")
                 return False
             
-            logger.info(f"📈 Цены SELL (2-е место): YES @ {yes_sell_price}, NO @ {no_sell_price}")
+            position_name = self.ask_position_offset + 1
+            logger.info(f"📈 Цены SELL ({position_name}-е место, offset={self.ask_position_offset}): YES @ {yes_sell_price}, NO @ {no_sell_price}")
             
             orders_created = 0
             

@@ -1,318 +1,195 @@
-# 🎯 Predict.fun SPLIT Farmer Bot
+# Predict.fun Trading Bot - SPLIT Strategy Points Farmer
 
-<div align="center">
+🎯 **Бот для фарминга Predict Points (PP) на платформе [Predict.fun](https://predict.fun)**
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge&logo=python&logoColor=white)
-![BNB Chain](https://img.shields.io/badge/BNB_Chain-Mainnet-yellow?style=for-the-badge&logo=binance&logoColor=black)
-![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
-![Telegram](https://img.shields.io/badge/Telegram-Bot-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)
-![WebSocket](https://img.shields.io/badge/WebSocket-Real--time-orange?style=for-the-badge)
+## 📋 Описание
 
-**Автоматический фарминг Predict Points (PP) на [Predict.fun](https://predict.fun) с нулевым риском**
+Этот бот реализует стратегию **SPLIT** для безрискового фарминга поинтов на prediction market платформе Predict.fun (BNB Chain).
 
-[Установка](#-установка) · [Конфигурация](#%EF%B8%8F-конфигурация) · [Запуск](#-запуск) · [Стратегия](#-стратегия-split) · [FAQ](#-faq)
+### Как работает стратегия SPLIT:
 
-</div>
+1. **ФАЗА 1**: Покупаем одновременно YES и NO токены
+   - YES + NO = 1.00 (при любом исходе получаем обратно $1)
+   
+2. **ФАЗА 2**: Выставляем SELL ордера на +1 цент от лучшего ASK
+   - Ордера стоят в очереди и **НЕ исполняются** сразу
+   - Фармим поинты за предоставление ликвидности
+   
+3. **РЕЗУЛЬТАТ**:
+   - ✅ Независимо от исхода события выходим в 0 или небольшой плюс
+   - ✅ Максимальный фарминг поинтов **БЕЗ РИСКА**!
 
----
-
-## ✨ Возможности
-
-- ⚡ **Real-time мониторинг** через WebSocket — мгновенная реакция на изменения стакана
-- 🤖 **Telegram-бот** — управление и уведомления прямо в Telegram
-- 👥 **Мульти-аккаунт** — управление несколькими кошельками из одного места
-- 📊 **Статистика сессии** — подсчёт заработанных PP в реальном времени
-- 🔄 **Авто-репозиционирование** — ордера всегда на лучших позициях в стакане
-- 🛡️ **Защита от риска** — стратегия SPLIT гарантирует возврат средств при любом исходе
-
----
-
-## 🧠 Стратегия SPLIT
-
-Стратегия основана на том, что `YES + NO = $1.00` при любом исходе события.
-
-```
-ФАЗА 1 ─── Покупаем YES + NO токены одновременно
-               │
-               │  YES + NO = $1.00 (нейтральная позиция)
-               ▼
-ФАЗА 2 ─── Выставляем SELL ордера на +1 цент от лучшего ASK
-               │
-               │  Ордера стоят в очереди ➜ Фармим PP за ликвидность
-               ▼
-ИТОГ   ─── Выходим в 0 или небольшой плюс + максимум Predict Points
-```
-
-### Почему это работает?
-
-| Условие | Результат |
-|---------|-----------|
-| Ордера НЕ исполнились | Получаем PP за ликвидность, выходим в 0 |
-| Один из ордеров исполнился | Получаем +$0.01 с продажи |
-| Оба ордера исполнились | Выходим в безубыток |
-
-> **Maker Fee = 0%** — размещение лимитных ордеров абсолютно бесплатно!
-
----
-
-## 💎 Система Predict Points
+## 💎 Система Predict Points (PP)
 
 Согласно [документации](https://docs.predict.fun/the-basics/how-to-earn-points):
 
-- 📌 **Лимитные ордера** на обеих сторонах (bid + ask) — бонусные PP
-- 📌 **Лучший bid/ask** в стакане — максимум PP
-- 📌 **Чем ближе к рыночной цене** — тем больше PP
-- 📌 **Держать позиции** на платформе — дополнительные PP
-- 📌 **Награды раздаются каждые 7 дней**
-
----
+- **Лимитные ордера** = поинты (чем ближе к рынку = больше PP)
+- **Лучший bid/ask** = МАКСИМУМ поинтов!
+- **Ордера на обеих сторонах** (bid + ask) = бонусные поинты
+- **Держать позиции** = дополнительные поинты
+- **Maker Fee = 0%** (размещение ордеров БЕСПЛАТНО!)
+- **Награды** распределяются каждые 7 дней
 
 ## 🚀 Установка
 
-### Требования
-
-- Python 3.10–3.12
-- Git
-
-### Клонирование
+### 1. Клонировать репозиторий
 
 ```bash
-git clone https://github.com/KIRSTa/predict-split-bot.git
-cd predict-split-bot
+cd "G:\Софты\Projects\Prediction fun"
+cd Predict_Bot
 ```
 
-### Виртуальное окружение
-
-<details>
-<summary>Windows (PowerShell)</summary>
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-</details>
-
-<details>
-<summary>Linux / macOS</summary>
+### 2. Установить зависимости
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-</details>
-
-### Зависимости
-
-```bash
-pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
----
-
-## ⚙️ Конфигурация
-
-### 1. Создайте `.env` из шаблона
+### 3. Настроить конфигурацию
 
 ```bash
-# Linux / macOS
-cp .env.example .env
-
-# Windows
+# Скопировать пример конфигурации
 copy .env.example .env
+
+# Отредактировать .env и указать свои ключи
+notepad .env
 ```
 
-### 2. Заполните `.env`
+## ⚙️ Конфигурация (.env)
 
 ```env
-# ── Telegram ──────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN=your_bot_token     # @BotFather
-TELEGRAM_ADMIN_ID=your_telegram_id   # @userinfobot
+# API Key (получить в Discord: https://discord.gg/predictdotfun)
+PREDICT_API_KEY=your_api_key_here
 
-# ── Predict.fun API ───────────────────────────────────────
-PREDICT_API_KEY=your_api_key          # Discord → тикет в support
+# Для EOA кошелька:
+PRIVATE_KEY=your_private_key_here
 
-# ── Кошелёк ───────────────────────────────────────────────
-# Вариант A — EOA кошелёк:
-PRIVATE_KEY=0x...
+# ИЛИ для Predict Account (Smart Wallet):
+PRIVY_WALLET_PRIVATE_KEY=your_privy_wallet_private_key_here
+PREDICT_ACCOUNT_ADDRESS=your_deposit_address_here
 
-# Вариант B — Predict Account (Smart Wallet):
-PRIVY_WALLET_PRIVATE_KEY=0x...        # predict.fun/account/settings
-PREDICT_ACCOUNT_ADDRESS=0x...         # Deposit Address
-
-# ── Сеть ──────────────────────────────────────────────────
-CHAIN_ID=56                           # 56 = BNB Mainnet, 97 = Testnet
-RPC_URL=https://bsc-dataseed.binance.org/
+# Отступ от лучшего ASK (0.01 = 1 цент)
+SPLIT_OFFSET=0.01
 ```
 
-### 3. Как получить API Key
+### Как получить API Key:
 
-1. Зайдите на Discord: [discord.gg/predictdotfun](https://discord.gg/predictdotfun)
+1. Присоединитесь к Discord: https://discord.gg/predictdotfun
 2. Откройте тикет в поддержке
-3. Запросите API key для торговли
+3. Запросите API key
 
-> На **testnet** API key не нужен — можно тестировать сразу!
+### Как экспортировать Privy Wallet:
 
-### 4. Мульти-аккаунт через `accounts.json`
+1. Перейдите в настройки аккаунта: https://predict.fun/account/settings
+2. Экспортируйте приватный ключ Privy Wallet
+3. Скопируйте Deposit Address (это ваш Predict Account Address)
 
-```json
-[
-  {
-    "name": "Main",
-    "private_key": "0x...",
-    "predict_account_address": "0x..."
-  },
-  {
-    "name": "Secondary",
-    "private_key": "0x...",
-    "predict_account_address": "0x..."
-  }
-]
-```
+## 📖 Использование
 
----
-
-## 📖 Запуск
-
-### Telegram-бот (рекомендуется)
+### Интерактивный режим (рекомендуется)
 
 ```bash
-python telegram_bot.py
-```
-
-Управляйте ботом прямо из Telegram:
-- `/start` — главное меню
-- Запуск/остановка фарминга по аккаунтам
-- Уведомления о репозиционировании ордеров
-
-### CLI режим
-
-```bash
-# Интерактивный выбор рынка
 python predict_trader.py
+```
 
-# Указать конкретный рынок
+Бот покажет список бинарных рынков и предложит выбрать один из них.
+
+### Указать конкретный рынок
+
+```bash
 python predict_trader.py --market 123
+```
 
-# Изменить размер ордера (USDT)
+### Изменить размер ордера
+
+```bash
 python predict_trader.py --market 123 --amount 10
+```
 
-# Изменить offset для SPLIT
+### Изменить offset для SPLIT
+
+```bash
 python predict_trader.py --market 123 --offset 0.02
+```
 
-# Debug режим
+### Debug режим
+
+```bash
 python predict_trader.py --market 123 --debug
 ```
 
-### Управление аккаунтами
+## 📊 Примерная оценка поинтов
 
-```bash
-python predict_trader.py --add-account     # Добавить аккаунт
-python predict_trader.py --remove-account  # Удалить аккаунт
-python predict_trader.py --list-accounts   # Список аккаунтов
-```
-
----
-
-## 📊 Пример вывода
+Бот автоматически подсчитывает примерное количество заработанных поинтов:
 
 ```
 📊 СТАТИСТИКА СЕССИИ
-════════════════════════════════════════════════════════════
-   Длительность:        2:30:15
-   Размещено ордеров:   24
-   Общий объём:         $120.00
-   Время в книге:       2.5 ч
-────────────────────────────────────────────────────────────
+============================================================
+   Длительность: 2:30:15
+   Размещено ордеров: 24
+   Общий объём: $120.00
+   Время в книге: 2.5 часов
+------------------------------------------------------------
    💎 ПРИМЕРНО ПОИНТОВ: 45.2 PP
-════════════════════════════════════════════════════════════
+============================================================
    ⚠️  Это приблизительная оценка!
    Точная формула PP не публикуется.
-════════════════════════════════════════════════════════════
+============================================================
 ```
-
----
 
 ## 📁 Структура проекта
 
 ```
-predict-split-bot/
-├── 📄 predict_trader.py        # Основной бот — стратегия SPLIT
-├── 📄 telegram_bot.py          # Telegram интерфейс управления
-├── 📄 predict_api.py           # REST API клиент для Predict.fun
-├── 📄 predict_ws.py            # WebSocket клиент (real-time)
-├── 📄 find_binary_markets.py   # Поиск и фильтрация бинарных рынков
-├── 📄 state.py                 # Менеджер состояния бота
-├── 📄 config.py                # Конфигурация и константы
-├── 📄 debug_api.py             # Утилиты для отладки API
-├── 📄 requirements.txt         # Python зависимости
-├── 📄 .env.example             # Шаблон конфигурации
-├── 📄 accounts.json.example    # Шаблон мульти-аккаунт конфига
-└── 📄 README.md
+Predict_Bot/
+├── config.py           # Конфигурация и константы
+├── predict_api.py      # REST API клиент для Predict.fun
+├── predict_trader.py   # Основной бот со стратегией SPLIT
+├── requirements.txt    # Зависимости Python
+├── .env.example        # Пример конфигурации
+└── README.md           # Документация
 ```
 
----
+## 🔧 API Документация
+
+- **REST API**: https://dev.predict.fun/
+- **Docs**: https://docs.predict.fun/
+- **Python SDK**: https://github.com/PredictDotFun/sdk-python
+- **Alternative UI**: https://api.predict.fun/docs
 
 ## ⚠️ Важные замечания
 
-### Лимиты платформы
+### Лимиты платформы:
 
-| Параметр | Значение |
-|----------|----------|
-| Минимальный ордер | $1 USDT |
-| Макс. ордеров на рынок | 10 |
-| Rate limit | 240 запросов/минуту |
-| Maker Fee | **0%** ✅ |
-| Taker Fee | 0.018% – 2% |
+- Минимальный ордер: **$1 USDT**
+- Максимум ордеров на рынок: **10** лимитных ордеров
+- Rate limit: **240 запросов/минуту**
 
-### Безопасность
+### Комиссии:
 
-> ⚠️ **КРИТИЧЕСКИ ВАЖНО**
+- **Maker Fee: 0%** (лимитные ордера БЕСПЛАТНО!)
+- **Taker Fee: 0.018% - 2%** (зависит от цены)
+- Формула: `Fee = Base Fee % × min(Price, 1-Price) × Shares`
+- 10% скидка по реферальной программе
 
-- ❌ **НИКОГДА** не публикуйте `accounts.json` с реальными ключами
-- ❌ **НИКОГДА** не добавляйте `.env` в git репозиторий
-- ✅ Используйте отдельный кошелёк специально для бота
-- ✅ Начинайте с **testnet** (CHAIN_ID=97) для тестирования
-- ✅ Начинайте с минимальных сумм ($1–$5)
+### Безопасность:
 
----
-
-## 🔧 Устранение неполадок
-
-**`401/403` от API** → Проверьте `PREDICT_API_KEY`, убедитесь что используете правильный endpoint (mainnet vs testnet)
-
-**Не получает JWT** → Проверьте `PRIVATE_KEY` и тип аккаунта (EOA vs Predict Account)
-
-**WebSocket не подключается** → Проверьте сеть/VPN, доступность `wss://ws.predict.fun/ws`
-
-**Ошибки пакетов:**
-```bash
-pip install --upgrade pip setuptools wheel
-pip install -r requirements.txt --no-cache-dir
-```
-
----
+- ❌ НИКОГДА не делитесь приватным ключом
+- ✅ Используйте отдельный кошелёк для бота
+- ✅ Начните с малых сумм для тестирования
+- ✅ На testnet API key не требуется
 
 ## 🔗 Полезные ссылки
 
-| Ресурс | Ссылка |
-|--------|--------|
-| 🌐 Платформа | [predict.fun](https://predict.fun) |
-| 📚 Документация | [docs.predict.fun](https://docs.predict.fun) |
-| 🔌 API Docs | [dev.predict.fun](https://dev.predict.fun) |
-| 🐍 Python SDK | [PyPI](https://pypi.org/project/predict-sdk/) · [GitHub](https://github.com/PredictDotFun/sdk-python) |
-| 💬 Discord | [discord.gg/predictdotfun](https://discord.gg/predictdotfun) |
-
----
+- [Predict.fun](https://predict.fun) - Платформа
+- [Документация](https://docs.predict.fun/) - Общая документация
+- [API Docs](https://dev.predict.fun/) - Техническая документация
+- [Discord](https://discord.gg/predictdotfun) - Сообщество
+- [Python SDK](https://pypi.org/project/predict-sdk/) - PyPI пакет
 
 ## 📜 Лицензия
 
-MIT License — используйте свободно, но на свой страх и риск.
+MIT License
 
 ---
 
-<div align="center">
-
-**Disclaimer**: Программа предоставляется «как есть». Автор не несёт ответственности за финансовые потери. Используйте отдельный кошелёк и начинайте с малых сумм.
-
-</div>
+**Disclaimer**: Это программное обеспечение предоставляется "как есть". Используйте на свой страх и риск. Автор не несёт ответственности за любые финансовые потери.

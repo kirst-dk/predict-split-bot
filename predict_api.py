@@ -64,6 +64,12 @@ class Market:
     description: str = ""
     # Тип рынка: DEFAULT, SPORTS_MATCH, CRYPTO_UP_DOWN, TWEET_COUNT, SPORTS_TEAM_MATCH
     market_variant: str = "DEFAULT"
+    # Boost (PP boosted markets получают больше поинтов)
+    is_boosted: bool = False
+    boost_starts_at: str = ""
+    boost_ends_at: str = ""
+    # Индекс суб-рынка внутри события (для NegRisk мульти-исходных рынков)
+    question_index: Optional[int] = None
     
     @property
     def is_binary(self) -> bool:
@@ -584,7 +590,8 @@ class PredictAPI:
         self,
         first: int = 50,
         after: str = None,
-        status: str = None
+        status: str = None,
+        is_boosted: bool = None
     ) -> Tuple[List[Market], Optional[str]]:
         """
         Получить список рынков
@@ -593,6 +600,7 @@ class PredictAPI:
             first: Количество рынков (пагинация)
             after: Курсор для следующей страницы
             status: Фильтр по статусу: 'OPEN' или 'RESOLVED'
+            is_boosted: Фильтр по boost статусу (True = только boosted)
             
         Returns:
             (список рынков, курсор для следующей страницы)
@@ -602,6 +610,8 @@ class PredictAPI:
             params['after'] = after
         if status:
             params['status'] = status
+        if is_boosted is not None:
+            params['isBoosted'] = 'true' if is_boosted else 'false'
         
         data = self._request('GET', '/v1/markets', params=params)
         
@@ -633,6 +643,10 @@ class PredictAPI:
                 image_url=m.get('imageUrl', ''),
                 description=m.get('description', ''),
                 market_variant=m.get('marketVariant', 'DEFAULT'),
+                is_boosted=m.get('isBoosted', False),
+                boost_starts_at=m.get('boostStartsAt', '') or '',
+                boost_ends_at=m.get('boostEndsAt', '') or '',
+                question_index=m.get('questionIndex'),
             ))
         
         cursor = data.get('cursor')
@@ -677,6 +691,10 @@ class PredictAPI:
             image_url=m.get('imageUrl', ''),
             description=m.get('description', ''),
             market_variant=m.get('marketVariant', 'DEFAULT'),
+            is_boosted=m.get('isBoosted', False),
+            boost_starts_at=m.get('boostStartsAt', '') or '',
+            boost_ends_at=m.get('boostEndsAt', '') or '',
+            question_index=m.get('questionIndex'),
         )
     
     def get_markets_for_split(
@@ -721,6 +739,43 @@ class PredictAPI:
         
         return good_markets
     
+    def get_boosted_markets_for_split(
+        self,
+        max_markets: int = 50,
+    ) -> List[Market]:
+        """
+        Получить BOOSTED рынки подходящие для SPLIT стратегии.
+        
+        Boosted рынки дают больше Predict Points (PP).
+        Фильтрует только бинарные рынки (ровно 2 исхода).
+        
+        Args:
+            max_markets: Максимальное количество рынков
+            
+        Returns:
+            Список boosted рынков с 2 исходами
+        """
+        good_markets = []
+        cursor = None
+        
+        while len(good_markets) < max_markets:
+            # Запрашиваем только ОТКРЫТЫЕ boosted рынки через API фильтр
+            markets, cursor = self.get_markets(
+                first=100, after=cursor, status='OPEN', is_boosted=True
+            )
+            
+            for market in markets:
+                # Только бинарные рынки (ровно 2 исхода)
+                if market.is_binary and not market.is_neg_risk:
+                    good_markets.append(market)
+                    if len(good_markets) >= max_markets:
+                        break
+            
+            if not cursor:
+                break
+        
+        return good_markets
+    
     def get_market_stats(self, market_id: int) -> Dict:
         """
         Получить статистику рынка (объём, ликвидность)
@@ -754,6 +809,70 @@ class PredictAPI:
         """
         # Используем новый метод
         return self.get_markets_for_split(max_markets=max_markets)
+    
+    # =========================================================================
+    # КАТЕГОРИИ (СОБЫТИЯ / EVENTS)
+    # =========================================================================
+    
+    def get_categories(self, status: str = 'OPEN', max_categories: int = 500) -> List[Dict]:
+        """
+        Получить список категорий (событий) с пагинацией.
+        NegRisk мульти-исходные рынки группируются по категориям.
+        
+        Args:
+            status: Фильтр по статусу (OPEN, CLOSED и т.д.)
+            max_categories: Максимальное количество категорий для загрузки
+            
+        Returns:
+            Список словарей с полями: slug, title, isNegRisk, markets, imageUrl, tags и др.
+        """
+        all_categories = []
+        cursor = None
+        
+        while len(all_categories) < max_categories:
+            params = {'first': 100}
+            if status:
+                params['status'] = status
+            if cursor:
+                params['after'] = cursor
+            
+            data = self._request('GET', '/v1/categories', params=params)
+            categories = data.get('data', [])
+            if not categories:
+                break
+            
+            all_categories.extend(categories)
+            cursor = data.get('cursor')
+            if not cursor:
+                break
+        
+        return all_categories[:max_categories]
+    
+    def get_category_by_slug(self, slug: str) -> Optional[Dict]:
+        """
+        Получить категорию (событие) по slug.
+        
+        Args:
+            slug: Slug категории (например '2026-fifa-world-cup-winner')
+            
+        Returns:
+            Словарь с полями: slug, title, isNegRisk, markets, imageUrl, tags и др.
+        """
+        try:
+            data = self._request('GET', f'/v1/categories/{slug}')
+            return data.get('data')
+        except Exception:
+            return None
+    
+    def get_neg_risk_events(self) -> List[Dict]:
+        """
+        Получить только NegRisk мульти-исходные события (категории).
+        
+        Returns:
+            Список категорий с isNegRisk=True и OPEN рынками
+        """
+        categories = self.get_categories(status='OPEN')
+        return [c for c in categories if c.get('isNegRisk', False)]
     
     # =========================================================================
     # ОРДЕРБУК
