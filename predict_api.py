@@ -864,15 +864,44 @@ class PredictAPI:
         except Exception:
             return None
     
-    def get_neg_risk_events(self) -> List[Dict]:
+    def get_market_last_sale_price(self, market_id: int) -> Optional[float]:
         """
-        Получить только NegRisk мульти-исходные события (категории).
+        Получить последнюю цену торговли YES для рынка
+        (используется как implied probability 0..1).
+        
+        Args:
+            market_id: ID рынка
+            
+        Returns:
+            Вероятность 0..1 (например 0.16 = 16%) или None
+        """
+        try:
+            data = self._request('GET', f'/v1/markets/{market_id}/last-sale')
+            raw = data.get('data', {}).get('priceInCurrency', '')
+            if raw:
+                return int(raw) / 10 ** 18
+        except Exception:
+            pass
+        return None
+
+    def get_multi_market_events(self) -> List[Dict]:
+        """
+        Получить все мульти-исходные события (категории с >1 рынком).
+        
+        Включает как NegRisk (World Cup, NBA), так и обычные
+        мульти-рынки (FDV above ___, Bitcoin above ___ и т.д.).
+        
+        Загружает ВСЕ категории (до 2000), чтобы не пропустить
+        спортивные события, которые находятся в конце пагинации.
         
         Returns:
-            Список категорий с isNegRisk=True и OPEN рынками
+            Список категорий с >1 OPEN рынком
         """
-        categories = self.get_categories(status='OPEN')
-        return [c for c in categories if c.get('isNegRisk', False)]
+        categories = self.get_categories(status='OPEN', max_categories=2000)
+        return [c for c in categories if len(c.get('markets', [])) > 1]
+    
+    # Обратная совместимость
+    get_neg_risk_events = get_multi_market_events
     
     # =========================================================================
     # ОРДЕРБУК
@@ -916,6 +945,74 @@ class PredictAPI:
             asks=asks,
             bids=bids,
         )
+    
+    # =========================================================================
+    # ТАЙМСЕРИИ (ИСТОРИЧЕСКИЕ ДАННЫЕ)
+    # =========================================================================
+    
+    def get_market_timeseries(
+        self,
+        market_id: int,
+        metric: str = "price",
+        resolution: str = "1h",
+        from_ts: int = None,
+        to_ts: int = None,
+        limit: int = None,
+        after: str = None,
+    ) -> Dict:
+        """
+        Получить таймсерии рынка (исторические данные цен/объёмов).
+        
+        Args:
+            market_id: ID рынка
+            metric: Метрика (например, 'price')
+            resolution: Разрешение ('1m', '5m', '15m', '1h', '4h', '1d')
+            from_ts: Начальный timestamp (unix)
+            to_ts: Конечный timestamp (unix)
+            limit: Максимальное количество точек
+            after: Курсор пагинации
+            
+        Returns:
+            {'resolution': str, 'series': [{'x': timestamp, 'y': value}, ...]}
+        """
+        params = {}
+        if metric:
+            params['metric'] = metric
+        if resolution:
+            params['resolution'] = resolution
+        if from_ts is not None:
+            params['from'] = from_ts
+        if to_ts is not None:
+            params['to'] = to_ts
+        if limit is not None:
+            params['limit'] = limit
+        if after:
+            params['after'] = after
+        
+        data = self._request('GET', f'/v1/markets/{market_id}/timeseries', params=params)
+        return data.get('data', {})
+    
+    def get_latest_market_timeseries_value(
+        self,
+        market_id: int,
+        metric: str = "price",
+    ) -> Optional[Dict]:
+        """
+        Получить последнее значение таймсерии рынка.
+        
+        Args:
+            market_id: ID рынка
+            metric: Метрика (например, 'price')
+            
+        Returns:
+            {'x': timestamp, 'y': value} или None
+        """
+        params = {}
+        if metric:
+            params['metric'] = metric
+        
+        data = self._request('GET', f'/v1/markets/{market_id}/timeseries/latest', params=params)
+        return data.get('data')
     
     # =========================================================================
     # ОРДЕРА
@@ -1010,7 +1107,17 @@ class PredictAPI:
         Создать ордер
         
         Args:
-            order_data: Данные ордера (см. SDK для построения)
+            order_data: Данные ордера (см. SDK для построения).
+                Поддерживаемые поля:
+                - order: подписанный ордер
+                - pricePerShare: цена за акцию
+                - strategy: 'LIMIT' | 'MARKET'
+                - isPostOnly: (только limit) предотвращает мгновенное исполнение
+                - selfTradePrevention: 'CANCEL_MAKER' | 'CANCEL_TAKER' | 'CANCEL_BOTH'
+                - isMinAmountOut: (только market bid) deflate taker_amount при slippage
+                - reservedBalancePolicy: 'REJECT_MARKET_ORDER' | 'SKIP_RESERVED_BALANCE_CHECKS'
+                - slippageBps: slippage в basis points
+                - isFillOrKill: true для FOK ордеров
             
         Returns:
             Ответ API с orderId и orderHash

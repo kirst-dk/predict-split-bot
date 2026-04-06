@@ -1211,6 +1211,8 @@ class PredictTrader:
                 'order': api_order,
                 'pricePerShare': str(price_per_share),
                 'strategy': 'LIMIT',
+                'isPostOnly': True,
+                'selfTradePrevention': 'CANCEL_MAKER',
             }
             
             # DEBUG: логируем что отправляем

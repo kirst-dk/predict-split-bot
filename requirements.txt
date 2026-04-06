@@ -2,8 +2,8 @@
 # =====================================
 
 # Predict SDK (официальный Python SDK)
-# v0.0.15 - slippage в order amounts, исправление error messages
-predict-sdk>=0.0.15
+# v0.0.16 - is_min_amount_out для BUY slippage (deflate taker_amount вместо inflate maker_amount)
+predict-sdk>=0.0.16
 
 # Web3 для работы с блокчейном
 web3>=6.0.0

@@ -3007,7 +3007,7 @@ async def callback_browse_detail(update: Update, context: ContextTypes.DEFAULT_T
             vol = volumes.get(market_id, 0)
             break
 
-    # Ищем в event_sub_markets (NegRisk)
+    # Ищем в event_sub_markets (мульти-событие)
     if not market:
         sub_markets = context.user_data.get('event_sub_markets', [])
         sub_volumes = context.user_data.get('event_sub_volumes', {})
@@ -3020,7 +3020,7 @@ async def callback_browse_detail(update: Update, context: ContextTypes.DEFAULT_T
                     'question': m.get('question', ''),
                     'category_slug': m.get('categorySlug', ''),
                     'is_boosted': m.get('isBoosted', False),
-                    'is_neg_risk': m.get('isNegRisk', True),
+                    'is_neg_risk': m.get('isNegRisk', False),
                 })()
                 vol = sub_volumes.get(market_id, 0)
                 break
@@ -3052,17 +3052,28 @@ async def callback_browse_detail(update: Update, context: ContextTypes.DEFAULT_T
     cat_key = _classify_category(getattr(market, 'category_slug', ''))
     cat_name = BROWSE_CATEGORY_NAMES.get(cat_key, '📋 Другое')
 
+    is_neg_risk_market = getattr(market, 'is_neg_risk', False)
+
     lines = [
         f"📌 *{md(display_name)}*",
         f"",
         f"🆔 ID: `{market_id}`",
         f"📂 Категория: {cat_name}",
-        f"📊 Объём: *{_format_volume(vol)}*",
     ]
+    if is_neg_risk_market:
+        lines.append(f"📊 Объём: *{_format_volume(vol)}*")
+        lines.append("🏆 *NegRisk* — мульти-исходный рынок")
+    else:
+        lines.append(f"📊 Объём: *{_format_volume(vol)}*")
+
+    # Для суб-рынков мульти-события показываем вероятность
+    sub_prices = context.user_data.get('event_sub_prices', {})
+    last_price = sub_prices.get(market_id)
+    if last_price is not None:
+        lines.append(f"🎯 Вероятность: *{int(round(last_price * 100))}%*")
+
     if getattr(market, 'is_boosted', False):
         lines.append("🔥 *PP BOOST активен!*")
-    if getattr(market, 'is_neg_risk', False):
-        lines.append("🏆 NegRisk мульти-исходный рынок")
     if best_bid is not None and best_ask is not None:
         lines.append(f"")
         lines.append(f"💹 Best BID: {best_bid * 100:.1f}¢")
@@ -3340,7 +3351,7 @@ async def callback_browse_events(update: Update, context: ContextTypes.DEFAULT_T
     try:
         from predict_api import PredictAPI
         api = PredictAPI()
-        events = await asyncio.to_thread(api.get_neg_risk_events)
+        events = await asyncio.to_thread(api.get_multi_market_events)
 
         if not events:
             keyboard = [[InlineKeyboardButton("« Меню рынков", callback_data="cmd_markets_menu")]]
@@ -3362,7 +3373,7 @@ async def callback_browse_events(update: Update, context: ContextTypes.DEFAULT_T
 
 async def _show_events_page(query, context, page: int):
     """Показать страницу списка NegRisk событий."""
-    EVENTS_PER_PAGE = 8
+    EVENTS_PER_PAGE = 10
 
     events = context.user_data.get('neg_risk_events', [])
     total_pages = max(1, (len(events) + EVENTS_PER_PAGE - 1) // EVENTS_PER_PAGE)
@@ -3375,12 +3386,13 @@ async def _show_events_page(query, context, page: int):
 
     keyboard = []
     for ev in page_events:
-        title = ev.get('title', ev.get('slug', 'Unknown'))[:40]
+        title = ev.get('title', ev.get('slug', 'Unknown'))[:38]
         markets_count = len(ev.get('markets', []))
         slug = ev.get('slug', '')
+        yield_badge = "✅" if ev.get('isYieldBearing', False) else ""
         keyboard.append([
             InlineKeyboardButton(
-                f"🏆 {title} ({markets_count})",
+                f"{yield_badge}🏆 {title} ({markets_count})",
                 callback_data=f"event_{slug[:50]}"
             )
         ])
@@ -3398,7 +3410,7 @@ async def _show_events_page(query, context, page: int):
     keyboard.append([InlineKeyboardButton("« Меню рынков", callback_data="cmd_markets_menu")])
 
     await query.edit_message_text(
-        f"🏆 *Мульти-события (NegRisk)*\n\n"
+        f"🏆 *Мульти-события*\n\n"
         f"Всего: {len(events)} событий | Стр. {page + 1}/{total_pages}\n"
         f"_Нажмите на событие чтобы увидеть исходы_",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -3436,7 +3448,7 @@ async def callback_event_detail(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("❌ Событие не найдено", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    await query.edit_message_text("⏳ Загрузка исходов...")
+    await query.edit_message_text("⏳ Загрузка исходов и вероятностей...")
 
     try:
         from predict_api import PredictAPI
@@ -3459,22 +3471,22 @@ async def callback_event_detail(update: Update, context: ContextTypes.DEFAULT_TY
         # Сортируем по questionIndex
         sub_markets.sort(key=lambda m: m.get('questionIndex', 0) or 0)
 
-        # Загружаем объёмы для суб-рынков
-        def _get_sub_volumes(api_inst, markets):
-            vols = {}
+        # Загружаем объёмы и цены (probability) для суб-рынков
+        def _get_sub_data(api_inst, markets):
+            volumes = {}
+            prices = {}
             for m in markets:
                 mid = m.get('id', 0)
-                try:
-                    stats = api_inst.get_market_stats(mid)
-                    vols[mid] = stats.get('volume_total', 0)
-                except Exception:
-                    vols[mid] = 0
-            return vols
+                stats = api_inst.get_market_stats(mid)
+                volumes[mid] = stats.get('volume_total', 0)
+                prices[mid] = api_inst.get_market_last_sale_price(mid)
+            return volumes, prices
 
-        volumes = await asyncio.to_thread(_get_sub_volumes, api, sub_markets)
+        volumes, prices = await asyncio.to_thread(_get_sub_data, api, sub_markets)
 
         context.user_data['event_sub_markets'] = sub_markets
         context.user_data['event_sub_volumes'] = volumes
+        context.user_data['event_sub_prices'] = prices
         context.user_data['event_slug'] = event.get('slug', '')
         context.user_data['event_title'] = event.get('title', slug)
         context.user_data['event_sub_page'] = 0
@@ -3492,6 +3504,7 @@ async def _show_event_sub_page(query, context, page: int):
 
     sub_markets = context.user_data.get('event_sub_markets', [])
     volumes = context.user_data.get('event_sub_volumes', {})
+    prices = context.user_data.get('event_sub_prices', {})
     event_title = context.user_data.get('event_title', 'Событие')
 
     total_pages = max(1, (len(sub_markets) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
@@ -3502,18 +3515,26 @@ async def _show_event_sub_page(query, context, page: int):
     end = start + ITEMS_PER_PAGE
     page_items = sub_markets[start:end]
 
-    # Общий объём события
-    total_vol = sum(volumes.values())
-
     keyboard = []
     for m in page_items:
         mid = m.get('id', 0)
-        title = m.get('title', f'#{mid}')[:35]
-        vol = _format_volume(volumes.get(mid, 0))
+        title = m.get('title', f'#{mid}')[:24]
+        vol = volumes.get(mid, 0)
+        price = prices.get(mid)
         boosted = "🔥" if m.get('isBoosted', False) else ""
+
+        # Процент (всегда показываем)
+        if price is not None:
+            pct_str = f" {int(round(price * 100))}%"
+        else:
+            pct_str = " —%"
+
+        # Объём (только если > 0)
+        vol_str = f" 📊{_format_volume(vol)}" if vol else ""
+
         keyboard.append([
             InlineKeyboardButton(
-                f"{boosted}{title} 📊{vol}",
+                f"{boosted}{title}{pct_str}{vol_str}",
                 callback_data=f"browse_detail_{mid}"
             )
         ])
@@ -3533,7 +3554,6 @@ async def _show_event_sub_page(query, context, page: int):
 
     await query.edit_message_text(
         f"🏆 *{md(event_title)}*\n\n"
-        f"📊 Общий объём: *{_format_volume(total_vol)}*\n"
         f"📋 Исходов: {len(sub_markets)} | Стр. {page + 1}/{total_pages}\n"
         f"_Нажмите на исход для деталей и SPLIT_",
         reply_markup=InlineKeyboardMarkup(keyboard),
