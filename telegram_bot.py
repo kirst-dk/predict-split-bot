@@ -41,7 +41,7 @@ from config import (
     USE_WEBSOCKET, WS_FALLBACK_INTERVAL, WS_MARKET_REFRESH_INTERVAL,
     REFERRAL_LINK, DISCONNECT_MESSAGE, MAX_USER_ACCOUNTS, USERS_DIR,
 )
-from predict_api import PredictAPI, wei_to_float
+from predict_api import PredictAPI, normalize_api_enum, wei_to_float
 from predict_trader import PredictTrader
 from predict_ws import PredictWebSocket
 from state import get_state, PersistentState, MarketTaskState, OrderState
@@ -3465,8 +3465,11 @@ async def callback_event_detail(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("📭 Нет исходов в этом событии", reply_markup=InlineKeyboardMarkup(keyboard))
             return
 
-        # Фильтруем только торгуемые рынки (tradingStatus=OPEN)
-        sub_markets = [m for m in sub_markets if m.get('tradingStatus') == 'OPEN']
+        # Фильтруем только торгуемые рынки (новые схемы могут отдавать enum как объект)
+        sub_markets = [
+            m for m in sub_markets
+            if normalize_api_enum(m.get('tradingStatus')) == 'OPEN'
+        ]
 
         # Сортируем по questionIndex
         sub_markets.sort(key=lambda m: m.get('questionIndex', 0) or 0)

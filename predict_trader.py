@@ -2842,8 +2842,8 @@ class PredictTrader:
                 logger.warning(f"   ⚠️  Рынок #{market_id} не найден")
                 return None
             
-            # Проверяем статус
-            if market.status not in ['REGISTERED', 'ACTIVE', 'OPEN']:
+            # Для мониторинга оставляем только реально торгуемые рынки
+            if market.status != 'OPEN':
                 logger.warning(f"   ⚠️  Рынок #{market_id} не активен: {market.status}")
                 return None
             

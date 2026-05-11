@@ -19,11 +19,21 @@ import asyncio
 import logging
 from typing import Optional, Dict, List, Callable, Any, Set
 from datetime import datetime
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from config import WS_URL
 
 logger = logging.getLogger(__name__)
 
-# WebSocket URL
-WS_URL = "wss://ws.predict.fun/ws"
+def _build_ws_url(base_url: str, api_key: str) -> str:
+    """Построить WS URL с учётом уже существующих query params."""
+    if not api_key:
+        return base_url
+
+    parts = urlsplit(base_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query['apiKey'] = api_key
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
 class PredictWebSocket:
@@ -106,12 +116,10 @@ class PredictWebSocket:
             logger.error("websockets не установлен! pip install websockets")
             return False
         
-        url = WS_URL
-        if self.api_key:
-            url += f"?apiKey={self.api_key}"
+        url = _build_ws_url(WS_URL, self.api_key)
         
         try:
-            logger.info(f"🔌 Подключение к WebSocket: {WS_URL}...")
+            logger.info(f"🔌 Подключение к WebSocket: {url}...")
             self._ws = await websockets.connect(
                 url,
                 ping_interval=None,  # мы сами обрабатываем heartbeats

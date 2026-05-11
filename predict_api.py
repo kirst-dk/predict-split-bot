@@ -23,6 +23,25 @@ from config import (
 logger = logging.getLogger(__name__)
 
 
+def normalize_api_enum(value: Any, default: str = "") -> str:
+    """
+    Нормализовать enum-подобное поле из Predict API.
+
+    Документация и схемы иногда описывают status / tradingStatus / marketVariant
+    как объекты. В рантайме нам нужен стабильный строковый вид для сравнений.
+    """
+    if isinstance(value, str):
+        return value.upper()
+
+    if isinstance(value, dict):
+        for key in ('value', 'name', 'code', 'status', 'type'):
+            nested = value.get(key)
+            if isinstance(nested, str):
+                return nested.upper()
+
+    return default.upper() if default else ""
+
+
 # =============================================================================
 # СТРУКТУРЫ ДАННЫХ
 # =============================================================================
@@ -451,6 +470,9 @@ class PredictAPI:
     
     def _update_headers(self):
         """Обновить заголовки сессии"""
+        self.session.headers.pop('Authorization', None)
+        self.session.headers.pop('x-api-key', None)
+
         headers = {
             'Content-Type': 'application/json',
             'Accept': 'application/json',
@@ -463,6 +485,64 @@ class PredictAPI:
             headers['Authorization'] = f'Bearer {self.jwt_token}'
         
         self.session.headers.update(headers)
+
+    @staticmethod
+    def _extract_cursor(payload: Dict[str, Any]) -> Optional[str]:
+        """Достать курсор пагинации из текущего или вложенного формата ответа."""
+        cursor = payload.get('cursor')
+        if cursor:
+            return cursor
+
+        nested = payload.get('data')
+        if isinstance(nested, dict):
+            return nested.get('cursor')
+
+        return None
+
+    @staticmethod
+    def _parse_outcome(data: Dict[str, Any]) -> Outcome:
+        """Преобразовать outcome из API в локальную структуру."""
+        return Outcome(
+            name=data.get('name', ''),
+            index_set=data.get('indexSet', 0),
+            on_chain_id=data.get('onChainId', ''),
+            status=normalize_api_enum(data.get('status'), 'PENDING'),
+        )
+
+    @classmethod
+    def _parse_market(cls, data: Dict[str, Any]) -> Market:
+        """Преобразовать market из API в локальную структуру."""
+        outcomes = [cls._parse_outcome(outcome) for outcome in data.get('outcomes', [])]
+        lifecycle_status = normalize_api_enum(data.get('status'))
+        trading_status = normalize_api_enum(data.get('tradingStatus'))
+
+        if lifecycle_status == 'RESOLVED':
+            effective_status = 'RESOLVED'
+        else:
+            effective_status = trading_status or lifecycle_status
+
+        return Market(
+            id=data.get('id', 0),
+            title=data.get('title', ''),
+            question=data.get('question', ''),
+            status=effective_status,
+            is_neg_risk=data.get('isNegRisk', False),
+            is_yield_bearing=data.get('isYieldBearing', True),
+            fee_rate_bps=data.get('feeRateBps', 0),
+            condition_id=data.get('conditionId', ''),
+            outcomes=outcomes,
+            spread_threshold=data.get('spreadThreshold', 0),
+            share_threshold=data.get('shareThreshold', 0),
+            decimal_precision=data.get('decimalPrecision', 2),
+            category_slug=data.get('categorySlug', ''),
+            image_url=data.get('imageUrl', ''),
+            description=data.get('description', ''),
+            market_variant=normalize_api_enum(data.get('marketVariant'), 'DEFAULT'),
+            is_boosted=data.get('isBoosted', False),
+            boost_starts_at=data.get('boostStartsAt', '') or '',
+            boost_ends_at=data.get('boostEndsAt', '') or '',
+            question_index=data.get('questionIndex'),
+        )
     
     def set_jwt_token(self, token: str):
         """Установить JWT токен для аутентификации"""
@@ -615,41 +695,8 @@ class PredictAPI:
         
         data = self._request('GET', '/v1/markets', params=params)
         
-        markets = []
-        for m in data.get('data', []):
-            outcomes = []
-            for o in m.get('outcomes', []):
-                outcomes.append(Outcome(
-                    name=o.get('name', ''),
-                    index_set=o.get('indexSet', 0),
-                    on_chain_id=o.get('onChainId', ''),
-                    status=o.get('status', 'PENDING'),
-                ))
-            
-            markets.append(Market(
-                id=m.get('id', 0),
-                title=m.get('title', ''),
-                question=m.get('question', ''),
-                status=m.get('status', ''),
-                is_neg_risk=m.get('isNegRisk', False),
-                is_yield_bearing=m.get('isYieldBearing', True),
-                fee_rate_bps=m.get('feeRateBps', 0),
-                condition_id=m.get('conditionId', ''),
-                outcomes=outcomes,
-                spread_threshold=m.get('spreadThreshold', 0),
-                share_threshold=m.get('shareThreshold', 0),
-                decimal_precision=m.get('decimalPrecision', 2),
-                category_slug=m.get('categorySlug', ''),
-                image_url=m.get('imageUrl', ''),
-                description=m.get('description', ''),
-                market_variant=m.get('marketVariant', 'DEFAULT'),
-                is_boosted=m.get('isBoosted', False),
-                boost_starts_at=m.get('boostStartsAt', '') or '',
-                boost_ends_at=m.get('boostEndsAt', '') or '',
-                question_index=m.get('questionIndex'),
-            ))
-        
-        cursor = data.get('cursor')
+        markets = [self._parse_market(market) for market in data.get('data', [])]
+        cursor = self._extract_cursor(data)
         return markets, cursor
     
     def get_market_by_id(self, market_id: int) -> Market:
@@ -663,39 +710,7 @@ class PredictAPI:
             Market объект
         """
         data = self._request('GET', f'/v1/markets/{market_id}')
-        m = data['data']
-        
-        outcomes = []
-        for o in m.get('outcomes', []):
-            outcomes.append(Outcome(
-                name=o.get('name', ''),
-                index_set=o.get('indexSet', 0),
-                on_chain_id=o.get('onChainId', ''),
-                status=o.get('status', 'PENDING'),
-            ))
-        
-        return Market(
-            id=m.get('id', 0),
-            title=m.get('title', ''),
-            question=m.get('question', ''),
-            status=m.get('status', ''),
-            is_neg_risk=m.get('isNegRisk', False),
-            is_yield_bearing=m.get('isYieldBearing', True),
-            fee_rate_bps=m.get('feeRateBps', 0),
-            condition_id=m.get('conditionId', ''),
-            outcomes=outcomes,
-            spread_threshold=m.get('spreadThreshold', 0),
-            share_threshold=m.get('shareThreshold', 0),
-            decimal_precision=m.get('decimalPrecision', 2),
-            category_slug=m.get('categorySlug', ''),
-            image_url=m.get('imageUrl', ''),
-            description=m.get('description', ''),
-            market_variant=m.get('marketVariant', 'DEFAULT'),
-            is_boosted=m.get('isBoosted', False),
-            boost_starts_at=m.get('boostStartsAt', '') or '',
-            boost_ends_at=m.get('boostEndsAt', '') or '',
-            question_index=m.get('questionIndex'),
-        )
+        return self._parse_market(data['data'])
     
     def get_markets_for_split(
         self, 
@@ -722,10 +737,11 @@ class PredictAPI:
         """
         good_markets = []
         cursor = None
+        page_size = 20
         
         while len(good_markets) < max_markets:
             # Запрашиваем только ОТКРЫТЫЕ рынки
-            markets, cursor = self.get_markets(first=100, after=cursor, status='OPEN')
+            markets, cursor = self.get_markets(first=page_size, after=cursor, status='OPEN')
             
             for market in markets:
                 # Проверяем что подходит для SPLIT
@@ -757,16 +773,17 @@ class PredictAPI:
         """
         good_markets = []
         cursor = None
+        page_size = 20
         
         while len(good_markets) < max_markets:
             # Запрашиваем только ОТКРЫТЫЕ boosted рынки через API фильтр
             markets, cursor = self.get_markets(
-                first=100, after=cursor, status='OPEN', is_boosted=True
+                first=page_size, after=cursor, status='OPEN', is_boosted=True
             )
             
             for market in markets:
-                # Только бинарные рынки (ровно 2 исхода)
-                if market.is_binary and not market.is_neg_risk:
+                # Применяем тот же фильтр, что и для основного SPLIT-отбора
+                if market.is_good_for_split:
                     good_markets.append(market)
                     if len(good_markets) >= max_markets:
                         break
@@ -842,7 +859,7 @@ class PredictAPI:
                 break
             
             all_categories.extend(categories)
-            cursor = data.get('cursor')
+            cursor = self._extract_cursor(data)
             if not cursor:
                 break
         
@@ -1076,16 +1093,16 @@ class PredictAPI:
                 maker_amount=order_data.get('makerAmount', '0'),
                 taker_amount=order_data.get('takerAmount', '0'),
                 price_per_share=price_per_share,
-                status=o.get('status', ''),
+                status=normalize_api_enum(o.get('status')),
                 amount_filled=o.get('amountFilled', '0'),
                 amount=o.get('amount', '0'),
                 is_neg_risk=o.get('isNegRisk', False),
                 is_yield_bearing=o.get('isYieldBearing', True),
-                strategy=o.get('strategy', 'LIMIT'),
+                strategy=normalize_api_enum(o.get('strategy'), 'LIMIT'),
                 reward_earning_rate=o.get('rewardEarningRate', 0.0),
             ))
         
-        cursor = data.get('cursor')
+        cursor = self._extract_cursor(data)
         return orders, cursor
     
     def get_open_orders(self) -> List[Order]:
@@ -1175,40 +1192,8 @@ class PredictAPI:
         
         positions = []
         for p in data.get('data', []):
-            # Парсим маркет
-            m = p.get('market', {})
-            outcomes = []
-            for o in m.get('outcomes', []):
-                outcomes.append(Outcome(
-                    name=o.get('name', ''),
-                    index_set=o.get('indexSet', 0),
-                    on_chain_id=o.get('onChainId', ''),
-                    status=o.get('status', 'PENDING'),
-                ))
-            
-            market = Market(
-                id=m.get('id', 0),
-                title=m.get('title', ''),
-                question=m.get('question', ''),
-                status=m.get('status', ''),
-                is_neg_risk=m.get('isNegRisk', False),
-                is_yield_bearing=m.get('isYieldBearing', True),
-                fee_rate_bps=m.get('feeRateBps', 0),
-                condition_id=m.get('conditionId', ''),
-                outcomes=outcomes,
-                spread_threshold=m.get('spreadThreshold', 0),
-                share_threshold=m.get('shareThreshold', 0),
-                decimal_precision=m.get('decimalPrecision', 2),
-            )
-            
-            # Парсим исход позиции
-            o = p.get('outcome', {})
-            outcome = Outcome(
-                name=o.get('name', ''),
-                index_set=o.get('indexSet', 0),
-                on_chain_id=o.get('onChainId', ''),
-                status=o.get('status', 'PENDING'),
-            )
+            market = self._parse_market(p.get('market', {}))
+            outcome = self._parse_outcome(p.get('outcome', {}))
             
             positions.append(Position(
                 id=p.get('id', ''),
@@ -1217,8 +1202,8 @@ class PredictAPI:
                 amount=p.get('amount', '0'),
                 value_usd=p.get('valueUsd', '0'),
             ))
-        
-        cursor = data.get('cursor')
+
+        cursor = self._extract_cursor(data)
         return positions, cursor
     
     def get_all_positions(self) -> List[Position]:
